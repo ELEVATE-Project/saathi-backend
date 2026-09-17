@@ -33,7 +33,8 @@ def _translate_chips(extra_content, voice_provider, route):
         except Exception as e:
             logger.error('[_translate_chips] chip translation exception: %s — using original', e)
             translated.append(chip)
-    return {**extra_content, 'quick_reply_chips': translated}
+    extra_content['quick_reply_chips'] = translated
+    return extra_content
 
 
 def translate_and_send_message(
