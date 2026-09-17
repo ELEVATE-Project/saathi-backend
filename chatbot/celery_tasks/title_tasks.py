@@ -1,4 +1,5 @@
 from celery import shared_task
+from django.db import transaction
 from chatbot.models import ChatSession, CompanyChat, Voice, VoiceType
 from chatbot.models.company_models import Flow
 from chatbot.llm_models.llm_gateway import call_llm_gateway, build_gateway_params, get_effective_provider_model
@@ -18,21 +19,30 @@ def _track_usage(session_id, response):
             'input_tokens': usage.get('input_tokens', 0) or 0,
             'output_tokens': usage.get('output_tokens', 0) or 0,
             'total_tokens': usage.get('total_tokens', 0) or 0,
+            'cache_read_tokens': usage.get('input_tokens_cache_read', 0) or 0,
+            'cache_write_tokens': usage.get('input_tokens_cache_write', 0) or 0,
             'cost_usd': cost.get('computed_usd', 0) or 0,
         }
         if not any(usage_cost.values()):
             return
-        session = ChatSession.objects.get(session=session_id)
-        other_params = session.other_params or {}
-        totals = other_params.get('usage', {})
-        logger.info("[usage] title call session %s before update: %s | this call: %s", session_id, totals, usage_cost)
-        totals['total_input_tokens'] = totals.get('total_input_tokens', 0) + usage_cost['input_tokens']
-        totals['total_output_tokens'] = totals.get('total_output_tokens', 0) + usage_cost['output_tokens']
-        totals['total_tokens'] = totals.get('total_tokens', 0) + usage_cost['total_tokens']
-        totals['total_cost_usd'] = round(totals.get('total_cost_usd', 0) + usage_cost['cost_usd'], 6)
-        other_params['usage'] = totals
-        session.other_params = other_params
-        session.save(update_fields=['other_params'])
+        # Locked so this read-modify-write of other_params can't race with the other
+        # other_params writers on this model (see BaseResponseHandler._update_session_usage).
+        with transaction.atomic():
+            session = ChatSession.objects.select_for_update().get(session=session_id)
+            other_params = session.other_params or {}
+            totals = other_params.get('usage', {})
+            logger.info("[usage] title call session %s before update: %s | this call: %s", session_id, totals, usage_cost)
+            totals['total_input_tokens'] = totals.get('total_input_tokens', 0) + usage_cost['input_tokens']
+            totals['total_output_tokens'] = totals.get('total_output_tokens', 0) + usage_cost['output_tokens']
+            totals['total_tokens'] = totals.get('total_tokens', 0) + usage_cost['total_tokens']
+            totals['total_cache_read_tokens'] = totals.get('total_cache_read_tokens', 0) + usage_cost['cache_read_tokens']
+            totals['total_cache_write_tokens'] = (
+                totals.get('total_cache_write_tokens', 0) + usage_cost['cache_write_tokens']
+            )
+            totals['total_cost_usd'] = round(totals.get('total_cost_usd', 0) + usage_cost['cost_usd'], 6)
+            other_params['usage'] = totals
+            session.other_params = other_params
+            session.save(update_fields=['other_params'])
         logger.info("[usage] title call session %s after update: %s", session_id, totals)
     except Exception as e:
         logger.error("[usage] failed to track title usage for session %s: %s", session_id, e)

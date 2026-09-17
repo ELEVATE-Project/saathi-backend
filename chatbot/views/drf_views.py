@@ -6,16 +6,15 @@ from rest_framework.response import Response
 from rest_framework import status
 from chatbot.filter.drf_filter import ChatSessionProfileFilter
 from chatbot.parsers import StrictJSONParser
-from chatbot.models import ChatSession, BotVernacular, SessionFlowName, ChatType
+from chatbot.models import ChatSession, BotVernacular, SessionFlowName
 from chatbot.models.company_models import CompanyChat, CompanyChatFeedback, CompanyBot, Flow
-from chatbot.models.profile_models import Profile
 from chatbot.serializer.base_serializer import ChatSessionSerializer
 from chatbot.serializer.company_serializer import (
-    CompanyBotSerializer, BotVernacularSerializer, ImageConfigurationSerializer,
+    CompanyBotSerializer, BotVernacularSerializer,
     FlowLanguagesSerializer, FlowConnectionInfoSerializer
 )
 from chatbot.serializer.profile_serializer import (
-    ProfileSerializer, CompanyChatSerializer, CompanyChatFeedbackSerializer
+    CompanyChatSerializer, CompanyChatFeedbackSerializer
 )
 
 
@@ -74,16 +73,15 @@ class BotVernacularRetrieveUpdateDestroyView(generics.RetrieveUpdateAPIView):
     serializer_class = BotVernacularSerializer
 
 
-class ProfileListCreateView(generics.ListCreateAPIView):
-    queryset = Profile.objects.all()
-    serializer_class = ProfileSerializer
-    filter_backends = [django_filters.rest_framework.DjangoFilterBackend]
-    filterset_fields = ['first_name', 'email', 'company__name', 'phone', 'company__slug']
-
-
-class ProfileRetrieveUpdateDestroyView(generics.RetrieveUpdateAPIView):
-    queryset = Profile.objects.all()
-    serializer_class = ProfileSerializer
+def _annotate_first_user_message(qs):
+    first_msg_sq = (
+        CompanyChat.objects
+        .filter(session=OuterRef('session'))
+        .exclude(sender_id=1)
+        .order_by('created_at')
+        .values('message')[:1]
+    )
+    return qs.annotate(first_user_message=Subquery(first_msg_sq))
 
 
 class ChatSessionListCreateView(generics.ListCreateAPIView):
@@ -94,6 +92,9 @@ class ChatSessionListCreateView(generics.ListCreateAPIView):
     ordering_fields = ['updated_at', 'created_at', 'id']
     ordering = ['-updated_at']
 
+    def get_queryset(self):
+        return _annotate_first_user_message(super().get_queryset())
+
 
 class ChatSessionRetrieveUpdateDestroyView(generics.RetrieveUpdateAPIView):
     queryset = ChatSession.objects.all()
@@ -101,50 +102,17 @@ class ChatSessionRetrieveUpdateDestroyView(generics.RetrieveUpdateAPIView):
     filter_backends = [django_filters.rest_framework.DjangoFilterBackend]
     filterset_fields = ['session']
 
+    def get_queryset(self):
+        return _annotate_first_user_message(super().get_queryset())
+
 
 class ChatSessionRetrieveUpdateDestroyViewSession(generics.RetrieveUpdateAPIView):
     queryset = ChatSession.objects.all()
     serializer_class = ChatSessionSerializer
     lookup_field = 'session'
 
-
-class FlowImageConfigView(generics.GenericAPIView):
-    """
-    API endpoint to get image configuration for a specific flow route.
-    Query param: flow_route (required)
-    Returns: ImageConfiguration object or 404
-    """
-    serializer_class = ImageConfigurationSerializer
-
-    def get(self, request, *args, **kwargs):
-        flow_route = request.query_params.get('flow_route')
-        
-        if not flow_route:
-            return Response(
-                {'error': 'flow_route query parameter is required'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        try:
-            flow = Flow.objects.select_related('image_config_id').get(
-                flow_route=flow_route,
-                active=True
-            )
-            
-            if not flow.image_config_id:
-                return Response(
-                    {'error': 'No image configuration found for this flow'},
-                    status=status.HTTP_404_NOT_FOUND
-                )
-            
-            serializer = self.get_serializer(flow.image_config_id)
-            return Response(serializer.data)
-            
-        except Flow.DoesNotExist:
-            return Response(
-                {'error': 'Flow not found or inactive'},
-                status=status.HTTP_404_NOT_FOUND
-            )
+    def get_queryset(self):
+        return _annotate_first_user_message(super().get_queryset())
 
 
 class FlowLanguagesView(generics.GenericAPIView):

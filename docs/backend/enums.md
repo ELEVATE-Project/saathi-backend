@@ -8,29 +8,11 @@ Enums ensure consistency, validation, and type safety for status fields, provide
 
 ---
 
-## 1. ChatStageChoices
+> **Note:** `ThemeType`, `TagChoices`, `TagSourceChoices`, `MediaTemplateChoices`, `StorySourceChoices`, `StoryStatusChoices`, and `CreateStoryChoices` were removed as unused (Story/Media/Theme cleanup). `ChatStageChoices`, `ChatType`, `FileDisplayMode`, `FileTypeChoices`, `LanguageChoices`, `PDFStrategyChoices`, `StoryLanguageChoices`, and `VoiceProviderChoices` were later removed as unused too (usage audit) — `ChatType` was an unused import in two files, the rest had zero references anywhere. `StoryLanguageChoices` specifically was replaced by a `Language`-table-sourced admin dropdown for `ChatSession.language` rather than being kept as a fixed choice list. `MediaTypeChoices` remains despite the naming — still used by kept code (`media_creation.py`'s PDF/DOCX generation). `MediaTemplateType` (new) is unrelated to the removed `MediaTemplateChoices` — it backs the current `MediaTemplate` model (see [Admin](../apps/chatbot/chatbot_admin.md)), not a leftover from the Story/Media cleanup.
+>
+> This reference has also been reconciled against the current `chatbot/models/enums.py`: `LLMProvider`'s value list was corrected (the legacy `BEDROCK_CONVERSE` value no longer exists; `ANTHROPIC` and `OPENROUTER` were added), `LLMModel` and `VoiceProvider`/`MediaTypeChoices`/`RouteLanguageChoices` were brought up to date with their current member lists, and `BotStrategyChoices`, `OperationTypeChoices`, `UserTypeChoices`, and `WebSearchContextSize` — previously undocumented — were added.
 
-### Purpose
-
-Represents predefined conversational stages in structured chat flows.
-    Used in state-machine based bots to control progression.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| WELCOME | Welcome_Strand |
-| ACHIEVEMENT_ORIENTATION | Achievement_Orientation |
-| COURAGE | Courage_Strand |
-| CONTINUOUS_LEARNING | Continuous_Strand |
-| CRITICAL_THINKING | Critical_Thinking_Strand |
-| PURPOSE | Purpose_Strand |
-| THANKYOU | Thank_You_Strand |
-| OTHER | Other |
-
----
-
-## 2. ChatStatus
+## 1. ChatStatus
 
 ### Purpose
 
@@ -49,33 +31,7 @@ Represents the lifecycle status of a chat session.
 
 ---
 
-## 3. ChatType
-
-### Purpose
-
-Defines supported chat workflow types.
-    Controls conversation structure and bot behavior.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| guidedReflection | normal |
-| oneStepReflection | oneshot |
-| shikshaChaupal | shikshalokam_chaupal |
-| reflection | reflection |
-| creation | creation |
-| megaPTM | megaPTM |
-| YLC | YLC |
-| listeningActivity | listening-activity |
-| ParentPerceptionSurvey | parent_perception_survey |
-| LCF | lcf |
-| LFA | lfa |
-| FreeFlow | free_flow |
-
----
-
-## 4. CompanyBotDynamicContextType
+## 2. CompanyBotDynamicContextType
 
 ### Purpose
 
@@ -91,7 +47,7 @@ Specifies dynamic context generation mechanism.
 
 ---
 
-## 5. CompanyBotTypeChoices
+## 3. CompanyBotTypeChoices
 
 ### Purpose
 
@@ -109,7 +65,7 @@ Defines architecture type of company bots.
 
 ---
 
-## 6. CompanyChatSourceChoices
+## 4. CompanyChatSourceChoices
 
 ### Purpose
 
@@ -125,7 +81,7 @@ Identifies source platform of a chat session.
 
 ---
 
-## 7. EntityStatus
+## 5. EntityStatus
 
 ### Purpose
 
@@ -141,7 +97,7 @@ Indicates whether an entity is active or inactive.
 
 ---
 
-## 8. EntityTypeChoices
+## 6. EntityTypeChoices
 
 ### Purpose
 
@@ -157,7 +113,7 @@ Marks whether an entity is mandatory or optional.
 
 ---
 
-## 9. FeedbackChoices
+## 7. FeedbackChoices
 
 ### Purpose
 
@@ -173,45 +129,7 @@ Captures feedback sentiment classification.
 
 ---
 
-## 10. FileDisplayMode
-
-### Purpose
-
-Controls file visibility scope and permissions.
-    Determines access for UI and AI processing.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| VISIBLE | visible |
-| AI_ONLY | ai_only |
-| PRIVATE | private |
-
----
-
-## 11. FileTypeChoices
-
-### Purpose
-
-Supported document file types with utility helpers.
-    Provides MIME, extension, and validation methods.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| PDF | application/pdf |
-| DOC | application/msword |
-| DOCX | application/vnd.openxmlformats-officedocument.wordprocessingml.document |
-| TXT | text/plain |
-| CSV | text/csv |
-| XLS | application/vnd.ms-excel |
-| XLSX | application/vnd.openxmlformats-officedocument.spreadsheetml.sheet |
-
----
-
-## 12. GenderChoices
+## 8. GenderChoices
 
 ### Purpose
 
@@ -227,7 +145,7 @@ Stores supported gender options.
 
 ---
 
-## 13. LLMModel
+## 9. LLMModel
 
 ### Purpose
 
@@ -258,61 +176,63 @@ Enumerates all supported AI model identifiers.
 | GPT5_2 | gpt-5.2 |
 | GPT5_2_PRO | gpt-5.2-pro |
 | GPT5_MINI | gpt-5-mini |
+| CLAUDE_3_HAIKU | claude-3-haiku-20240307 |
+| CLAUDE_3_SONNET | claude-3-sonnet-20240229 |
+| CLAUDE_3_OPUS | claude-3-opus-20240229 |
+| CLAUDE_3_5_SONNET | claude-3-5-sonnet-20241022 |
+| CLAUDE_3_5_HAIKU | claude-3-5-haiku-20241022 |
+| CLAUDE_3_7_SONNET | claude-3-7-sonnet-20250219 |
+| CLAUDE_HAIKU_4_5 | claude-haiku-4-5 |
+| CLAUDE_SONNET_4_5 | claude-sonnet-4-5 |
+| CLAUDE_OPUS_4_5 | claude-opus-4-5 |
 
 ---
 
-## 14. LLMProvider
+## 10. LLMProvider
 
 ### Purpose
 
 Lists supported Large Language Model providers.
-    Determines which AI backend service is used.
+    Determines which AI backend service is used. Legacy — the actual LLM call for a
+    conversation turn is now routed through the LLM Gateway using `CompanyBot.gateway_provider`
+    (a free-text field populated live from the gateway's provider catalog), not this enum; see
+    [Response Handlers](../apps/chatbot/chatbot_response_handlers.md).
 
 ### Values
 
 | Name | Value |
 |------|-------|
 | BEDROCK | bedrock |
-| BEDROCK_CONVERSE | bedrock/converse |
 | OPENAI | openai |
+| ANTHROPIC | anthropic |
+| OPENROUTER | openrouter |
 
 ---
 
-## 15. LanguageChoices
+## 11. MediaTemplateType
 
 ### Purpose
 
-Lists supported language-region codes.
-    Used for localization and speech services.
+Output format a `MediaTemplate` row produces — decides which of that model's
+type-specific fields is used (`template` for PDF, `template_file` for DOCX).
+Deliberately a plain enum, not a DB-driven table like `Language`/`Provider` —
+unlike adding a language, adding a new output format always requires new
+rendering code (a new `render_*_from_template()` function in
+`media_creation.py`), so DB-configurability would add indirection without
+removing the need for a deploy. See [Admin](../apps/chatbot/chatbot_admin.md)
+for the `MediaTemplate` model and admin behavior, and
+[Utils](../apps/chatbot/chatbot_utils.md) for the render functions.
 
 ### Values
 
 | Name | Value |
 |------|-------|
-| INDIAN_ENGLISH | en-IN |
-| INDIAN_HINDI | hi-IN |
-| US_ENGLISH | en-US |
-| INDIAN_KANNADA | kn-IN |
+| PDF | PDF |
+| DOCX | DOCX |
 
 ---
 
-## 16. MediaTemplateChoices
-
-### Purpose
-
-Defines supported media template formats.
-    Used in content rendering workflows.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| EJS | EJS |
-| RAW_TEXT | RAW-TEXT |
-
----
-
-## 17. MediaTypeChoices
+## 12. MediaTypeChoices
 
 ### Purpose
 
@@ -333,28 +253,11 @@ Supported MIME types for uploaded media.
 | HEIF | image/heif |
 | HEIC | image/heic |
 | XLSX | application/vnd.openxmlformats-officedocument.spreadsheetml.sheet |
+| DOCX | application/vnd.openxmlformats-officedocument.wordprocessingml.document |
 
 ---
 
-## 18. PDFStrategyChoices
-
-### Purpose
-
-Lists available PDF generation strategies.
-    Determines rendering engine implementation.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| HTMLPDF | HTMLPDF |
-| PUPPETEER | PUPPETEER |
-| HTMLDOCX | HTMLDOCX |
-| XLSX | XLSX |
-
----
-
-## 19. PostProcessOutputMode
+## 13. PostProcessOutputMode
 
 ### Purpose
 
@@ -370,7 +273,7 @@ Controls workflow behavior after postprocessing.
 
 ---
 
-## 20. PostProcessType
+## 14. PostProcessType
 
 ### Purpose
 
@@ -387,7 +290,7 @@ Defines postprocessing strategy after LLM response.
 
 ---
 
-## 21. PreProcessOutputMode
+## 15. PreProcessOutputMode
 
 ### Purpose
 
@@ -403,7 +306,7 @@ Controls behavior after preprocessing stage.
 
 ---
 
-## 22. PreProcessType
+## 16. PreProcessType
 
 ### Purpose
 
@@ -420,7 +323,7 @@ Defines preprocessing strategy before LLM execution.
 
 ---
 
-## 23. ProfileType
+## 17. ProfileType
 
 ### Purpose
 
@@ -437,7 +340,7 @@ Defines different user profile roles.
 
 ---
 
-## 24. RouteLanguageChoices
+## 18. RouteLanguageChoices
 
 ### Purpose
 
@@ -452,10 +355,12 @@ Maps URL route prefixes to language codes.
 | HINDI | hi |
 | KANNADA | kn |
 | TELUGU | te |
+| ODIA | or |
+| TAMIL | ta |
 
 ---
 
-## 25. SessionFlowName
+## 19. SessionFlowName
 
 ### Purpose
 
@@ -480,91 +385,7 @@ Represents predefined session flow identifiers.
 
 ---
 
-## 26. StoryLanguageChoices
-
-### Purpose
-
-Lists supported languages for stories.
-    Used for multilingual story management.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| ENGLISH | en |
-| HINDI | hi |
-| KANNADA | kn |
-| TELUGU | te |
-
----
-
-## 27. StorySourceChoices
-
-### Purpose
-
-Specifies origin of story content.
-    Tracks AI, user, or third-party sources.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| AI_GENERATED | AI_GENERATED |
-| USER_GENERATED | USER_GENERATED |
-| THIRD_PARTY | THIRD_PARTY |
-
----
-
-## 28. StoryStatusChoices
-
-### Purpose
-
-Represents lifecycle state of a story.
-    Used to track processing and completion status.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| PENDING | PENDING |
-| COMPLETED | COMPLETED |
-
----
-
-## 29. TagChoices
-
-### Purpose
-
-Defines moderation status for tags.
-    Used in approval and publishing workflows.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| APPROVED | Approved |
-| PENDING | Pending |
-
----
-
-## 30. TagSourceChoices
-
-### Purpose
-
-Identifies origin of a tag entry.
-    Distinguishes manual and AI-based tagging.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| MANUAL | MANUAL |
-| AI_EXTRACTED | AI_EXTRACTED |
-| AI_GENERATED | AI_GENERATED |
-
----
-
-## 31. TextConversionType
+## 20. TextConversionType
 
 ### Purpose
 
@@ -580,23 +401,7 @@ Specifies text transformation operation type.
 
 ---
 
-## 32. ThemeType
-
-### Purpose
-
-Specifies theme source for a bot instance.
-    Used to select custom or master UI themes.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| CUSTOM | custom |
-| MASTER | master |
-
----
-
-## 33. VoiceProvider
+## 21. VoiceProvider
 
 ### Purpose
 
@@ -608,32 +413,14 @@ Lists supported speech processing providers.
 | Name | Value |
 |------|-------|
 | GOOGLE | GOOGLE |
-| GOOGLE_V1 | GOOGLE_V1 |
 | AI4Bharat | AI4Bharat |
 | OPENAI_WHISPER | OPENAI_WHISPER |
 | SARVAM | Sarvam |
+| CUSTOM_LLM | CUSTOM_LLM |
 
 ---
 
-## 34. VoiceProviderChoices
-
-### Purpose
-
-Lists supported cloud voice providers.
-    Used for speech-to-text and text-to-speech services.
-
-### Values
-
-| Name | Value |
-|------|-------|
-| AWS | aws |
-| GCP | gcp |
-| AZURE | azure |
-| ELEVEN_LABS | eleven-labs |
-
----
-
-## 35. VoiceType
+## 22. VoiceType
 
 ### Purpose
 
@@ -648,5 +435,76 @@ Defines type of voice processing operation.
 | TextToText | TextToText |
 | TextToSpeech | TextToSpeech |
 | Transliterate | Transliterate |
+
+---
+
+## 23. BotStrategyChoices
+
+### Purpose
+
+Names the bot-strategy classes registered in `BotServiceFactory`. Only `COMMON` is reachable
+today — every websocket session connects through the single `ws/common/` route and hardcodes
+`bot_type='common'`, so `ONESHOT`/`GUIDED_GUEST`/`GUEST_DISCUSSION` are unused values kept only
+because `CompanyBot.strategy` still offers them as admin choices. See
+[Strategies](../apps/chatbot/chatbot_strategies.md).
+
+### Values
+
+| Name | Value |
+|------|-------|
+| ONESHOT | oneshot |
+| GUIDED_GUEST | guided_guest |
+| GUEST_DISCUSSION | guest_discussion |
+| COMMON | common |
+
+---
+
+## 24. OperationTypeChoices
+
+### Purpose
+
+Marks whether a `CompanyStateMachine` step calls the LLM or is answered purely from
+database-configured content (`bot_question`) with no model call at all.
+
+### Values
+
+| Name | Value |
+|------|-------|
+| LLM | llm |
+| NON_LLM | non_llm |
+
+---
+
+## 25. UserTypeChoices
+
+### Purpose
+
+Restricts which category of user (guest, authenticated, or both) a `Flow`, `PDFTemplates`,
+or similar per-flow configuration row applies to.
+
+### Values
+
+| Name | Value |
+|------|-------|
+| GUEST | guest |
+| AUTH | auth |
+| ALL | all |
+
+---
+
+## 26. WebSearchContextSize
+
+### Purpose
+
+How much context a web search tool call retrieves for a `CompanyBot` with
+`enable_web_search` turned on. Only takes effect when `enable_web_search` is True.
+
+### Values
+
+| Name | Value |
+|------|-------|
+| LOW | low |
+| MEDIUM | medium |
+| HIGH | high |
 
 ---
