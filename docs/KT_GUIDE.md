@@ -103,7 +103,7 @@ only indirectly through another page; **Gap** — not documented anywhere.
 |---|---|---|---|
 | Grab-bag utilities (S3, Elevate profile sync, chat/audio/SQL helpers, transliteration, media preview) | `chatbot/utils/` | [Utils](apps/chatbot/chatbot_utils.md) | Full |
 | Management commands | `chatbot/management/commands/` | [Management Commands](apps/chatbot/chatbot_management.md) | Full |
-| One-off / ops scripts | `chatbot/scripts/` | [Scripts](apps/chatbot/chatbot_scripts.md) | Full — see the known-issues list below for a pre-existing broken import in `lang_detect_eval.py`. |
+| One-off / ops scripts | `chatbot/scripts/` | [Scripts](apps/chatbot/chatbot_scripts.md) | Full — note a pre-existing broken import in `lang_detect_eval.py` (`chatbot.scripts.lang_detect_sample_texts` does not exist in the repo). |
 | Admin templates | `chatbot/templates/` | [Templates](apps/chatbot/chatbot_templates.md) | Full |
 
 ### 7. Integrations
@@ -111,55 +111,3 @@ only indirectly through another page; **Gap** — not documented anywhere.
 | Module | Source | Documentation | Coverage |
 |---|---|---|---|
 | Qdrant vector database | External service, wired via `vector_service.py` | [API Documentation](integrations/vector_db/qdrant/api_documentation.md), [Developer Guide](integrations/vector_db/qdrant/developer_guide.md), [System Architecture](integrations/vector_db/qdrant/system_architecture.md), [Testing Guide](integrations/vector_db/qdrant/testing_guide.md) | Full |
-
----
-
-## Known gaps and open issues
-
-These are called out here rather than silently left for someone to discover,
-since a KT session is exactly where they should surface:
-
-1. **`chatbot/services/storage/` has no documentation.** The storage-backend
-   factory (local filesystem vs. AWS) that generated PDFs/DOCX files are
-   persisted through has never had a dedicated page written for it. See
-   §5 above.
-2. **`chatbot/scripts/lang_detect_eval.py` has a pre-existing broken import**
-   (`from chatbot.scripts.lang_detect_sample_texts import SAMPLE_TEXTS` — that
-   module does not exist in the repo, only a stale compiled `.pyc` remains).
-   This predates the current cleanup effort; the script is a
-   `shell_plus`-paste utility, so it only matters if someone actually tries to
-   run it. Documented in [Scripts](apps/chatbot/chatbot_scripts.md).
-3. **`SIMPLE_JWT['TOKEN_SERIALIZER']` in `shikshalokam_mohini/settings.py`
-   points at `chatbot.serializers.ProfileTokenObtainPairSerializer`**, but the
-   actual package is `chatbot.serializer` (singular), and no
-   `ProfileTokenObtainPairSerializer` class exists anywhere in the codebase.
-   This setting only matters if `rest_framework_simplejwt`'s own token views
-   are ever exercised directly — worth confirming whether that ever happens
-   before treating it as dead configuration versus a live bug.
-4. **Model/enum documentation has no automated regeneration.** The script that
-   previously generated `models.md`'s format (`generate_models_docs.py`) was
-   removed as unused code with no replacement. Both `models.md` and
-   `enums.md` are now accurate as of this pass but will drift again with the
-   next model/enum change unless updated by hand at the same time.
-5. **Vector search (`vector_service.py`) has no dedicated backend-app page**
-   — see §4 above. The Qdrant integration docs cover the infrastructure side
-   well; the calling code itself is described only inline, from the response
-   handler's perspective, in
-   [WebSocket Response Handling §5.3](apps/chatbot/chatbot_response_handlers.md).
-
-## Suggested session order for a new engineer
-
-1. **Foundations** — project configuration, developer setup, domain glossary,
-   models, enums, authentication.
-2. **Request surface** — URLs/routing, views, admin, serializers/filters.
-3. **Real-time chat pipeline** (likely two sessions given its size) —
-   consumers → core services → strategies first, to build the shape of the
-   pipeline; then a dedicated session on
-   [WebSocket Response Handling](apps/chatbot/chatbot_response_handlers.md)
-   alone, since it carries most of the actual conversational logic.
-4. **LLM, translation, and vector search** — the gateway/direct-call split,
-   translation providers, and how knowledge-base search is invoked as a tool.
-5. **Documents, storage, and media** — template-driven PDF/DOCX generation
-   and where the storage-backend gap (§5/§1 above) needs to be closed.
-6. **Operational modules** — utils, management commands, scripts, templates.
-7. **Integrations** — Qdrant.
