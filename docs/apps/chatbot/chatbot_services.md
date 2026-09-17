@@ -4,6 +4,14 @@
 
 The chatbot core services coordinate essential functions like session management, message preparations, prompt building, and orchestration of chatbot workflows to provide responsive conversational experiences.
 
+This page covers the orchestration layer under `chatbot/services/core/`. The
+response-generation layer it delegates into — `services/response_handlers/`
+(`BaseResponseHandler`, `CommonResponseHandler`), plus the supporting
+`services/preprocessing/` and `services/postprocessing/` services — is
+documented in depth in [WebSocket Response Handling](chatbot_response_handlers.md),
+since that layer holds the bulk of the conversational logic and warrants its
+own dedicated reference.
+
 ## Key Services in Detail
 
 ### BaseChatService

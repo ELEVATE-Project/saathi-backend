@@ -23,3 +23,14 @@ Only one flow is live: every websocket session — regardless of bot type (guide
 
 - Located in `chatbot/consumers/async_base_consumer.py`.
 - Base class providing common async WebSocket consumer utilities that `AsyncSocketConsumer` extends.
+
+## Downstream processing
+
+`AsyncSocketConsumer` only authenticates the connection, persists the inbound
+message, and enqueues a Celery task — it never calls the LLM or blocks on a
+response. The full request path from there (Celery task → orchestrator →
+strategy → response handler → LLM gateway → delivery back through this
+consumer's `chat_message` handler), including a line-by-line breakdown of
+`AsyncBaseConsumer`'s idle-timeout and disconnect bookkeeping and
+`AsyncSocketConsumer`'s `authenticate`/message-translation logic, is covered
+in depth in [WebSocket Response Handling](chatbot_response_handlers.md).

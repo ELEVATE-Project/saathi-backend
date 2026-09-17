@@ -75,23 +75,31 @@ Note: this endpoint's URL route (`api/profile/`) is currently commented out/disa
 
 ---
 
-##### 3. Login (`login`)
+##### 3. Login (`login`) and Logout (`logout`) — defined but not routed
 
-- Validate email and password
-- Verify hashed password using `check_password`
-- Fetch associated ProfileAddress
-- Issue JWT access token via `RefreshToken`
-- Store session authentication state
-- Return authenticated profile metadata
+`api_views.py` defines a local-password login/logout pair, but neither is
+wired to a URL in `chatbot/urls.py` (see [URLs and Routing](chatbot_urls.md)) —
+dead code, not a live endpoint. For reference, what they implement:
 
----
+- `login`: validates email/password, verifies the hash via `check_password`,
+  fetches the associated `ProfileAddress`, issues a JWT access token via
+  `RefreshToken`, stores session authentication state, returns profile
+  metadata.
+- `logout`: extracts the token from the Authorization header, blacklists it
+  via `BlacklistedToken`, clears the Django session, removes the session
+  cookie.
 
-##### 4. Logout (`logout`)
+##### 4. Logout (`logout_profile`) — the actually routed endpoint
 
-- Extract token from Authorization header
-- Blacklist JWT token via `BlacklistedToken`
-- Clear Django session
-- Remove session cookie
+`POST /api/logout/` is routed to `logout_profile`, not `logout`. It is
+Elevate-UMS-backed rather than local:
+
+- Reads the access/refresh token from cookies (or `X-auth-token`/
+  `X-refresh-token` headers as a fallback)
+- Calls `logout_elevate_user(access_token, refresh_token)` to invalidate the
+  session with Elevate
+- Surfaces Elevate auth/server errors as structured error responses
+- Clears the local response cookies on success
 
 ---
 

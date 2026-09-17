@@ -14,9 +14,11 @@ theme:
 
 nav:
   - Home: index.md
+  - Knowledge Transfer Guide: KT_GUIDE.md
 
   - Getting Started:
       - Developer Setup: setup/developer_setup.md
+      - Project Configuration: setup/project_configuration.md
       - Gotenberg Server Setup: setup/gotenberg_server_setup.md
   - Applications:
        - Chatbot:
@@ -24,6 +26,7 @@ nav:
           - Authentication: apps/chatbot/chatbot_auth.md
           - Admin: apps/chatbot/chatbot_admin.md
           - Services: apps/chatbot/chatbot_services.md
+          - WebSocket Response Handling (Deep Dive): apps/chatbot/chatbot_response_handlers.md
           - Strategies: apps/chatbot/chatbot_strategies.md
           - Consumers: apps/chatbot/chatbot_consumers.md
           - Celery Tasks: apps/chatbot/chatbot_celery_tasks.md

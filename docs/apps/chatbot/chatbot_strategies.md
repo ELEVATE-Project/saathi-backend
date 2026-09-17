@@ -17,3 +17,7 @@ The CommonBotStrategy is the sole strategy registered in `BotServiceFactory` and
 - Offers extensibility to support a wide range of chatbot flows without the need for separate custom strategies.
 
 This structured approach keeps the strategy layer extensible — a new bot type can be added later by implementing `BotStrategy` and registering it via `BotServiceFactory.register_strategy(...)` — without requiring the previously-removed per-flow strategy classes.
+
+For the response handler this strategy delegates into — including the full
+LLM tool-call loop, state-machine advancement, and free-flow tools like
+`download_file` — see [WebSocket Response Handling](chatbot_response_handlers.md).

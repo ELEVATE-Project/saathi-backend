@@ -516,7 +516,51 @@ Performs parallel chunked text translation.
 
 ---
 
-## 5. Shared Audio Utilities
+## 5. Custom LLM-Based Translation
+
+`chatbot/translate/custom/custom_llm.py`
+
+### Purpose
+
+Performs text translation by prompting a company bot's own configured LLM
+(Bedrock or OpenAI, via `chatbot.llm_models.llm_script`) instead of calling a
+dedicated translation API — used when a bot's `Voice`/provider configuration
+selects this as the translation backend rather than AI4Bharat/Google/Sarvam.
+
+### Responsibilities
+
+- Build a translation prompt from `source_language`/`target_language`
+- Dispatch to `handle_bedrock_model` or `handle_openai_model` based on
+  `company_bot.provider`
+- Parse/repair the LLM's JSON response into the standard `{status, content}`
+  shape
+
+---
+
+## 6. Google Cloud Translation Glossary
+
+`chatbot/translate/google/google_glossary.py`
+
+### Purpose
+
+Admin-time helper (not part of the runtime STT/TTS/translate request path)
+for building a Google Cloud Translation glossary from a CSV: uploads the CSV
+to GCS and registers a glossary via the Translation API. Invoked from the
+Django admin after a `Voice` row is saved.
+
+### Responsibilities
+
+- Parse an uploaded CSV of term pairs
+- Upload the CSV to Google Cloud Storage
+- Create/register the glossary via the Translation API
+
+Runtime translation reads the resulting `glossary_id`/`location` back out of
+`Voice.other_params`; `google_translate.py` itself is unchanged by this and
+still does the actual per-request translation call.
+
+---
+
+## 7. Shared Audio Utilities
 
 ### Audio Utilities
 

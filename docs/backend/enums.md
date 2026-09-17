@@ -9,6 +9,8 @@ Enums ensure consistency, validation, and type safety for status fields, provide
 ---
 
 > **Note:** `ThemeType`, `TagChoices`, `TagSourceChoices`, `MediaTemplateChoices`, `StorySourceChoices`, `StoryStatusChoices`, and `CreateStoryChoices` were removed as unused (Story/Media/Theme cleanup). `ChatStageChoices`, `ChatType`, `FileDisplayMode`, `FileTypeChoices`, `LanguageChoices`, `PDFStrategyChoices`, `StoryLanguageChoices`, and `VoiceProviderChoices` were later removed as unused too (usage audit) — `ChatType` was an unused import in two files, the rest had zero references anywhere. `StoryLanguageChoices` specifically was replaced by a `Language`-table-sourced admin dropdown for `ChatSession.language` rather than being kept as a fixed choice list. `MediaTypeChoices` remains despite the naming — still used by kept code (`media_creation.py`'s PDF/DOCX generation). `MediaTemplateType` (new) is unrelated to the removed `MediaTemplateChoices` — it backs the current `MediaTemplate` model (see [Admin](../apps/chatbot/chatbot_admin.md)), not a leftover from the Story/Media cleanup.
+>
+> This reference has also been reconciled against the current `chatbot/models/enums.py`: `LLMProvider`'s value list was corrected (the legacy `BEDROCK_CONVERSE` value no longer exists; `ANTHROPIC` and `OPENROUTER` were added), `LLMModel` and `VoiceProvider`/`MediaTypeChoices`/`RouteLanguageChoices` were brought up to date with their current member lists, and `BotStrategyChoices`, `OperationTypeChoices`, `UserTypeChoices`, and `WebSearchContextSize` — previously undocumented — were added.
 
 ## 1. ChatStatus
 
@@ -174,6 +176,15 @@ Enumerates all supported AI model identifiers.
 | GPT5_2 | gpt-5.2 |
 | GPT5_2_PRO | gpt-5.2-pro |
 | GPT5_MINI | gpt-5-mini |
+| CLAUDE_3_HAIKU | claude-3-haiku-20240307 |
+| CLAUDE_3_SONNET | claude-3-sonnet-20240229 |
+| CLAUDE_3_OPUS | claude-3-opus-20240229 |
+| CLAUDE_3_5_SONNET | claude-3-5-sonnet-20241022 |
+| CLAUDE_3_5_HAIKU | claude-3-5-haiku-20241022 |
+| CLAUDE_3_7_SONNET | claude-3-7-sonnet-20250219 |
+| CLAUDE_HAIKU_4_5 | claude-haiku-4-5 |
+| CLAUDE_SONNET_4_5 | claude-sonnet-4-5 |
+| CLAUDE_OPUS_4_5 | claude-opus-4-5 |
 
 ---
 
@@ -182,15 +193,19 @@ Enumerates all supported AI model identifiers.
 ### Purpose
 
 Lists supported Large Language Model providers.
-    Determines which AI backend service is used.
+    Determines which AI backend service is used. Legacy — the actual LLM call for a
+    conversation turn is now routed through the LLM Gateway using `CompanyBot.gateway_provider`
+    (a free-text field populated live from the gateway's provider catalog), not this enum; see
+    [Response Handlers](../apps/chatbot/chatbot_response_handlers.md).
 
 ### Values
 
 | Name | Value |
 |------|-------|
 | BEDROCK | bedrock |
-| BEDROCK_CONVERSE | bedrock/converse |
 | OPENAI | openai |
+| ANTHROPIC | anthropic |
+| OPENROUTER | openrouter |
 
 ---
 
@@ -238,6 +253,7 @@ Supported MIME types for uploaded media.
 | HEIF | image/heif |
 | HEIC | image/heic |
 | XLSX | application/vnd.openxmlformats-officedocument.spreadsheetml.sheet |
+| DOCX | application/vnd.openxmlformats-officedocument.wordprocessingml.document |
 
 ---
 
@@ -339,6 +355,8 @@ Maps URL route prefixes to language codes.
 | HINDI | hi |
 | KANNADA | kn |
 | TELUGU | te |
+| ODIA | or |
+| TAMIL | ta |
 
 ---
 
@@ -395,10 +413,10 @@ Lists supported speech processing providers.
 | Name | Value |
 |------|-------|
 | GOOGLE | GOOGLE |
-| GOOGLE_V1 | GOOGLE_V1 |
 | AI4Bharat | AI4Bharat |
 | OPENAI_WHISPER | OPENAI_WHISPER |
 | SARVAM | Sarvam |
+| CUSTOM_LLM | CUSTOM_LLM |
 
 ---
 
@@ -417,5 +435,76 @@ Defines type of voice processing operation.
 | TextToText | TextToText |
 | TextToSpeech | TextToSpeech |
 | Transliterate | Transliterate |
+
+---
+
+## 23. BotStrategyChoices
+
+### Purpose
+
+Names the bot-strategy classes registered in `BotServiceFactory`. Only `COMMON` is reachable
+today — every websocket session connects through the single `ws/common/` route and hardcodes
+`bot_type='common'`, so `ONESHOT`/`GUIDED_GUEST`/`GUEST_DISCUSSION` are unused values kept only
+because `CompanyBot.strategy` still offers them as admin choices. See
+[Strategies](../apps/chatbot/chatbot_strategies.md).
+
+### Values
+
+| Name | Value |
+|------|-------|
+| ONESHOT | oneshot |
+| GUIDED_GUEST | guided_guest |
+| GUEST_DISCUSSION | guest_discussion |
+| COMMON | common |
+
+---
+
+## 24. OperationTypeChoices
+
+### Purpose
+
+Marks whether a `CompanyStateMachine` step calls the LLM or is answered purely from
+database-configured content (`bot_question`) with no model call at all.
+
+### Values
+
+| Name | Value |
+|------|-------|
+| LLM | llm |
+| NON_LLM | non_llm |
+
+---
+
+## 25. UserTypeChoices
+
+### Purpose
+
+Restricts which category of user (guest, authenticated, or both) a `Flow`, `PDFTemplates`,
+or similar per-flow configuration row applies to.
+
+### Values
+
+| Name | Value |
+|------|-------|
+| GUEST | guest |
+| AUTH | auth |
+| ALL | all |
+
+---
+
+## 26. WebSearchContextSize
+
+### Purpose
+
+How much context a web search tool call retrieves for a `CompanyBot` with
+`enable_web_search` turned on. Only takes effect when `enable_web_search` is True.
+
+### Values
+
+| Name | Value |
+|------|-------|
+| LOW | low |
+| MEDIUM | medium |
+| HIGH | high |
 
 ---

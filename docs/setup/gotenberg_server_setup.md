@@ -5,8 +5,12 @@
 Chatbot document PDFs (e.g. the MIP "Improvement Plan") are rendered by a separate
 **Gotenberg** service (headless Chromium). The Django app POSTs HTML to it via
 `GOTENBERG_URL` (`.../forms/chromium/convert/html`). The HTML template and its
-localized labels live in the **database** (`PDFTemplates`, `template_name='MIP'`),
-not in the repo.
+localized labels live in the **database** (`MediaTemplate`, `type='PDF'`,
+`template_name='MIP'`), not in the repo. `MediaTemplate` replaced the older
+`PDFTemplates` model as the live source for this render path — see
+[Utils](../apps/chatbot/chatbot_utils.md#media-templates-and-document-generation);
+`PDFTemplates` rows still exist in the DB but are no longer read by any live
+render path, so editing them has no effect on generated PDFs.
 
 **Symptom this doc prevents:** non-English labels (Tamil / Hindi / Kannada / Odia)
 render as tofu boxes (□) in the PDF while English renders fine. DOCX is unaffected.
@@ -175,7 +179,7 @@ sudo docker restart "$GC"
 
 ## 2. Name the fonts in the DB template CSS
 
-The `PDFTemplates.template` (name=`MIP`) has font stacks like `"Arial", sans-serif`.
+The `MediaTemplate.template` row (`type='PDF'`, name=`MIP`) has font stacks like `"Arial", sans-serif`.
 Add the Noto fonts after the Latin font so Indic characters resolve. One example:
 
 ```css
@@ -200,8 +204,8 @@ Applying the edit from the server:
 cd ~/saathi-backend && python manage.py shell
 ```
 ```python
-from chatbot.models.company_models import PDFTemplates
-t = PDFTemplates.objects.get(template_name='MIP')
+from chatbot.models.company_models import MediaTemplate
+t = MediaTemplate.objects.get(template_name='MIP')  # type='PDF'
 t.template = (t.template
   .replace('"Arial", sans-serif',
            '"Arial", "Noto Sans Tamil", "Noto Sans Devanagari", "Noto Sans Kannada", "Noto Sans Oriya", sans-serif')

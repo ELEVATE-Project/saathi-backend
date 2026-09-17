@@ -13,7 +13,7 @@ The chatbot application exposes HTTP API endpoints (`chatbot/urls.py`, mounted a
 
 ### Example Endpoints
 
-- `/api/login/`, `/api/logout/`, `/api/generate-session/`: Auth/session lifecycle.
+- `/api/logout/` (routed to `logout_profile`, an Elevate-UMS-backed logout), `/api/generate-session/`: Auth/session lifecycle. `api_views.py` also defines `login`/`logout` functions with a local-password/blacklist-token implementation (see [Views](views.md#2-authentication-profile-session-apis)), but neither is wired to a URL here — dead code, not a live endpoint.
 - `/api/get-profile/`, `/api/update-profile/`, `/api/accept-tnc/`, `/api/create-profile/`: Profile management.
 - `/api/shikshalokam/read-elevate-profile/`: Elevate UMS profile lookup.
 - `/api/save-company-chat/`, `/api/create-chatsession/`, `/api/chatsession/`: Chat session management.
