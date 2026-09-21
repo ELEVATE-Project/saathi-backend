@@ -30,7 +30,7 @@ The Chatbot app is organized into the following major components:
 
 ```plain
 chatbot/
-├── auth.py                   # Authentication logic
+├── middlewares/               # Request-level auth middleware (VerifyAuthToken)
 ├── services/                 # Core chatbot services
 │   ├── core/                 # Orchestrator, prompt/message building, bot service factory
 │   ├── strategies/           # Bot behavior strategies

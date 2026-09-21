@@ -19,6 +19,5 @@ It enables:
 - Language/provider configuration for translation and speech services
 
 > **Note:** Story generation, project creation, knowledge-base document ingestion/search
-> (Media), and the `observability` LLM-evaluation app were removed as not part of
-> Saathi's current scope — see the repo-root `CODE_CLEANUP_PLAN.md` for the full
-> history of what was removed and why.
+> (Media), and the `observability` LLM-evaluation app are not part of
+> Saathi's current scope and are not present in this codebase.

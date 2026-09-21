@@ -4,7 +4,7 @@
 
 This layer defines the complete database schema for the chatbot platform.
 
-It manages persistence, relationships, constraints, indexing, and domain-level behavior across users, bots, conversations, and configuration. (Story/Media/Theme/I18n domain models — knowledge-base document storage, vector indexing, tagging, story content — were removed as not part of Saathi's scope; see the repo-root `CODE_CLEANUP_PLAN.md`.)
+It manages persistence, relationships, constraints, indexing, and domain-level behavior across users, bots, conversations, and configuration. (Story/Media/Theme/I18n domain models — knowledge-base document storage, vector indexing, tagging, story content — are not part of Saathi's scope and are not present in this codebase.)
 
 ---
 

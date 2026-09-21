@@ -9,13 +9,11 @@ deep that documentation currently goes, and what — if anything — is still
 missing. It is a planning and tracking document, not a substitute for the
 module-level pages it links to.
 
-This guide reflects the documentation state as of the current cleanup pass
-(see the repo-root `CODE_CLEANUP_PLAN.md` for the full history of what was
-removed from the codebase and why). It should be revisited whenever a module
-is added, removed, or substantially changed, since none of the reference
-documentation it links to is auto-generated — everything listed below can
-drift out of sync with the code again if it is not updated alongside future
-changes.
+This guide reflects the current documentation state. It should be revisited
+whenever a module is added, removed, or substantially changed, since none of
+the reference documentation it links to is auto-generated — everything
+listed below can drift out of sync with the code again if it is not updated
+alongside future changes.
 
 ## System overview
 
@@ -23,10 +21,10 @@ The backend is a single Django project, `shikshalokam_mohini` (project
 configuration and settings root — see
 [Project Configuration](setup/project_configuration.md)), running one
 Django app, `chatbot` (all business logic — see
-[Chatbot Overview](apps/chatbot/overview.md)). Two Django apps that
-previously existed in this repo — `shikshalokam` and `observability` — were
-removed in full during the cleanup effort; only stale, git-ignored
-`__pycache__` directories remain on disk for them, with no importable source.
+[Chatbot Overview](apps/chatbot/overview.md)). Two other Django app names —
+`shikshalokam` and `observability` — appear only as stale, git-ignored
+`__pycache__` directories on disk, with no importable source; neither is an
+active part of this codebase.
 
 The center of the system is a single WebSocket route (`ws/common/`) through
 which every chat interaction, regardless of bot type, flows. A message
@@ -56,10 +54,9 @@ only indirectly through another page; **Gap** — not documented anywhere.
 |---|---|---|---|
 | Project configuration (settings, URLs root, ASGI/WSGI, Celery app) | `shikshalokam_mohini/` | [Project Configuration](setup/project_configuration.md) | Full |
 | Developer environment setup | — | [Developer Setup](setup/developer_setup.md) | Full |
-| Domain glossary | repo root `UBIQUITOUS_LANGUAGE.md` | (root file, not under `docs/`) | Full |
 | Enum/choice fields | `chatbot/models/enums.py` | [Enums](backend/enums.md) | Full |
 | Django models | `chatbot/models/` | [Models](apps/chatbot/models.md) | Full — backfilled this pass to cover every current model (`CompanyChatFeedback`, `Flow`, `ImageConfiguration`, `Language`, `LanguageProviderConfig`, `MediaTemplate`, `PDFTemplates`, `Provider`), and corrected several existing entries that had drifted (`BotVernacular`, `ChatSession`, `CompanyBot`, `CompanyStateMachine`, `Voice`). No regeneration script exists any more (`generate_models_docs.py` was removed as unused) — this file must be hand-updated alongside future model changes. |
-| Authentication | `chatbot/auth.py`, `chatbot/middlewares/` | [Authentication](apps/chatbot/chatbot_auth.md) | Full |
+| Authentication | `chatbot/middlewares/` | [Authentication](apps/chatbot/chatbot_auth.md) | Full |
 
 ### 2. Request/response surface
 

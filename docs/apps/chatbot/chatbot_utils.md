@@ -2,7 +2,7 @@
 
 ## Overview
 
-The utilities module contains helper functions and classes that support various chatbot operations ranging from audio processing, translation, and profile handling to LLM integrations and PDF/DOCX generation. Story/Media-specific helpers (project formatting, image-converter, database/vector utilities, knowledge-service extraction, and the per-flow tool-call helpers for the removed consumers) were removed — see the repo-root `CODE_CLEANUP_PLAN.md` for the full history.
+The utilities module contains helper functions and classes that support various chatbot operations ranging from audio processing, translation, and profile handling to LLM integrations and PDF/DOCX generation. Story/Media-specific helpers (project formatting, image-converter, database/vector utilities, knowledge-service extraction, and the per-flow tool-call helpers for flow-specific consumers) are not part of Saathi's scope and are not present in this codebase.
 
 ## Key Utility Files and Functions
 

@@ -7,9 +7,9 @@ single Django app holding all business logic. `DJANGO_SETTINGS_MODULE` is
 `asgi.py`, `wsgi.py`).
 
 The package name predates the current scope of the project (it was originally
-the Mohini/Shikshalokam project); it has no relation to the now-deleted
-`shikshalokam` Django app (see the repo-root `CODE_CLEANUP_PLAN.md`) beyond
-sharing part of a name.
+the Mohini/Shikshalokam project); it has no relation to the `shikshalokam`
+Django app name beyond sharing part of a name — that app is not present in
+this codebase.
 
 ## Files
 
@@ -32,8 +32,7 @@ sharing part of a name.
   wins — `config/secrets.json` itself is untracked (see `.gitignore`); the
   repo only ships `config/__init__.py`.
 - **`INSTALLED_APPS`** — notably: `chatbot` is the only project-specific app
-  left (`shikshalokam` and `observability` were removed; see
-  [Chatbot Overview](../apps/chatbot/overview.md)); `jazzmin` provides the
+  (see [Chatbot Overview](../apps/chatbot/overview.md)); `jazzmin` provides the
   admin theme; `simple_history` backs every model's audit trail
   (`HistoricalRecords()`); `django_s3_storage`/`storages` back file storage;
   `import_export` backs the CSV/XLSX import-export admin mixins; `log_viewer`

@@ -13,7 +13,7 @@ Responsibilities of this layer:
 
 Views coordinate execution but do not contain heavy domain logic.
 
-> **Note:** Story/Media/recommendation/location-specific view modules (`views/story_views.py`, `views/Media/*`, `views/recommendation.py`, `views/location_views.py`, `views/kafka_views.py`, `views/mitra_views.py`, `views/gotenberg_view.py`, `views/admin/post_processing_views.py`) were removed as not part of Saathi's scope — see the repo-root `CODE_CLEANUP_PLAN.md` for the full history.
+> **Note:** Story/Media/recommendation/location-specific view modules (`views/story_views.py`, `views/Media/*`, `views/recommendation.py`, `views/location_views.py`, `views/kafka_views.py`, `views/mitra_views.py`, `views/gotenberg_view.py`, `views/admin/post_processing_views.py`) are not part of Saathi's scope and are not present in this codebase.
 
 ---
 

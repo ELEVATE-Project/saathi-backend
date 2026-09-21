@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document covers the serializers and filters modules within the chatbot application, which play crucial roles in data transformation, validation, and querying. Story/Media-specific serializers and filters (`media_serializer.py`, `story_serializer.py`, `media_filters.py`, `flow_filter.py`, `story_filter.py`) were removed along with those features — see the repo-root `CODE_CLEANUP_PLAN.md` for the full history.
+This document covers the serializers and filters modules within the chatbot application, which play crucial roles in data transformation, validation, and querying. Story/Media-specific serializers and filters (`media_serializer.py`, `story_serializer.py`, `media_filters.py`, `flow_filter.py`, `story_filter.py`) are not part of Saathi's scope and are not present in this codebase.
 
 ## Serializers
 

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `admin` module contains Django admin customizations facilitating management of chatbot configurations and content through the Django Admin interface. Story/Media/Theme/I18n admin modules (`story_admin.py`, `media_admin.py`, `theme_admin.py`, `i18n_admin.py`) were removed along with those models — see the repo-root `CODE_CLEANUP_PLAN.md` for the full history.
+The `admin` module contains Django admin customizations facilitating management of chatbot configurations and content through the Django Admin interface. Story/Media/Theme/I18n admin modules (`story_admin.py`, `media_admin.py`, `theme_admin.py`, `i18n_admin.py`) are not part of Saathi's scope and are not present in this codebase.
 
 ## Key Admin Modules
 

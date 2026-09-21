@@ -2,7 +2,7 @@
 
 ## Overview
 
-The chatbot application exposes HTTP API endpoints (`chatbot/urls.py`, mounted at the root by `shikshalokam_mohini/urls.py`) and a single WebSocket route (`chatbot/routing.py`) for chatbot functionality. Story/Media-specific routes (story management, media batch upload/tracking/document-search, PDF generation, PTM question-save, location lookups) were removed as not part of Saathi's scope — see the repo-root `CODE_CLEANUP_PLAN.md` for the full history.
+The chatbot application exposes HTTP API endpoints (`chatbot/urls.py`, mounted at the root by `shikshalokam_mohini/urls.py`) and a single WebSocket route (`chatbot/routing.py`) for chatbot functionality. Story/Media-specific routes (story management, media batch upload/tracking/document-search, PDF generation, PTM question-save, location lookups) are not part of Saathi's scope and are not present in this codebase.
 
 ## HTTP URL Routing
 
