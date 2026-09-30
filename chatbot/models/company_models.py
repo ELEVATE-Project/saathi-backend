@@ -1,3 +1,5 @@
+import json
+import logging
 import os
 from copy import deepcopy
 
@@ -7,16 +9,19 @@ from django.utils import timezone
 from django.core.validators import MinValueValidator, MaxValueValidator
 from simple_history.models import HistoricalRecords
 
+from chatbot.constants.tool_definitions import SEARCH_KNOWLEDGE_BASE_TOOL, SEARCH_KNOWLEDGE_BASE_TOOL_NAME
 from chatbot.constants.voice_provider_defaults import get_provider_defaults, VOICE_PROVIDER_DEFAULTS
+from chatbot.constants.provider_slugs import VOICE_PROVIDER_TO_SLUG, SLUG_TO_VOICE_PROVIDER
 from chatbot.models.enums import (
-    CreateStoryChoices, EntityStatus, LLMModel, GenderChoices, ChatStatus,
+    EntityStatus, LLMModel, GenderChoices, ChatStatus,
     FeedbackChoices, CompanyBotTypeChoices, CompanyBotDynamicContextType, CompanyChatSourceChoices,
     VoiceProvider, VoiceType, LLMProvider, EntityTypeChoices, TextConversionType,
     PreProcessType, PreProcessOutputMode, PostProcessType, PostProcessOutputMode,
-    UserTypeChoices, OperationTypeChoices, BotStrategyChoices, WebSearchContextSize
+    UserTypeChoices, OperationTypeChoices, BotStrategyChoices, WebSearchContextSize, MediaTemplateType
 )
 
 S3_BASE_URL = os.getenv('S3_BASE_URL')
+logger = logging.getLogger(__name__)
 
 
 class Company(models.Model):
@@ -154,7 +159,11 @@ class CompanyBot(models.Model):
         null=True, blank=True, help_text="Provide pre-context that will be set before the main prompt to shape the "
                                          "conversation."
     )
-    tool_context = models.TextField(null=True, blank=True)
+    tool_context = models.TextField(
+        null=True, blank=True,
+        help_text="JSON tool definitions for the LLM. For SIMPLE bots, the search_knowledge_base "
+                  "entry here is auto-added/removed based on Use vector service."
+    )
     other_params = models.JSONField(null=True, blank=True)
 
     connect_timeout = models.FloatField(default=5.0, help_text="Timeout in seconds for establishing a LLM connection.")
@@ -174,7 +183,9 @@ class CompanyBot(models.Model):
         default=False,
         help_text=(
             "Enable vector knowledge base search. Uses a two-step LLM call: "
-            "first to extract the search query, then to answer with retrieved context."
+            "first to extract the search query, then to answer with retrieved context. "
+            "SIMPLE bots only: on save, this adds/removes the search_knowledge_base tool "
+            "in Tool context automatically, leaving other tools untouched."
         )
     )
     enable_web_search = models.BooleanField(
@@ -187,29 +198,128 @@ class CompanyBot(models.Model):
         default=WebSearchContextSize.MEDIUM,
         help_text="Amount of context the web search retrieves. Only used when enable_web_search is True."
     )
+    enable_cache = models.BooleanField(
+        default=False,
+        help_text="Enable prompt/tool caching via the LLM gateway. When enabled, Cache TTL and "
+                  "Cache Targets become required."
+    )
+    cache_ttl = models.CharField(
+        max_length=20, null=True, blank=True,
+        help_text="TTL to use for cached content. Choices are fetched live from the LLM gateway. "
+                  "Required when Enable Cache is checked."
+    )
+    cache_targets = models.JSONField(
+        null=True, blank=True,
+        help_text="List of request parts to cache (e.g. ['prompt', 'tools']). Choices are fetched "
+                  "live from the LLM gateway. Required when Enable Cache is checked."
+    )
 
     history = HistoricalRecords()
 
     def __str__(self):
         return self.name
 
+    def clean(self):
+        if self.enable_cache:
+            errors = {}
+            if not self.cache_ttl:
+                errors['cache_ttl'] = "Cache TTL is required when Enable Cache is checked."
+            if not self.cache_targets:
+                errors['cache_targets'] = "Cache targets are required when Enable Cache is checked."
+            if errors:
+                raise ValidationError(errors)
+        elif self.cache_ttl or self.cache_targets:
+            self.cache_ttl = None
+            self.cache_targets = None
+
+    @staticmethod
+    def _tool_entry_name(entry):
+        return (entry.get('function', {}) or {}).get('name') or entry.get('name', '')
+
+    def _sync_vector_search_tool(self):
+        """Keep the search_knowledge_base tool entry in tool_context in step with
+        use_vector_service, for SIMPLE bots only (tool_context on STATE_MACHINE bots
+        lives per-step on CompanyStateMachine and is left untouched here).
+        Returns True if self.tool_context was changed."""
+        if self.bot_type != CompanyBotTypeChoices.SIMPLE:
+            return False
+
+        raw = (self.tool_context or '').strip()
+        parsed = None
+        if raw:
+            try:
+                import json_repair
+                parsed = json_repair.repair_json(raw, return_objects=True)
+            except Exception as e:
+                logger.error(f"CompanyBot {self.pk}: failed to parse tool_context while syncing vector search tool: {e}")
+                return False
+
+        if isinstance(parsed, dict):
+            tools_key = 'tools' if 'tools' in parsed else ('tool' if 'tool' in parsed else 'tools')
+            tools = list(parsed.get(tools_key) or [])
+        elif isinstance(parsed, list):
+            tools_key = None
+            tools = list(parsed)
+        else:
+            tools_key = None
+            tools = []
+
+        has_tool = any(self._tool_entry_name(t) == SEARCH_KNOWLEDGE_BASE_TOOL_NAME for t in tools)
+
+        if self.use_vector_service:
+            if has_tool:
+                return False
+            tools = tools + [SEARCH_KNOWLEDGE_BASE_TOOL]
+        else:
+            if not has_tool:
+                return False
+            tools = [t for t in tools if self._tool_entry_name(t) != SEARCH_KNOWLEDGE_BASE_TOOL_NAME]
+
+        if not tools:
+            self.tool_context = None
+        elif tools_key:
+            parsed[tools_key] = tools
+            self.tool_context = json.dumps(parsed, ensure_ascii=False)
+        else:
+            self.tool_context = json.dumps(tools, ensure_ascii=False)
+        return True
+
     def save(self, *args, **kwargs):
+        duplicate_route = CompanyBot.objects.filter(
+            company=self.company, route=self.route,
+        ).exclude(pk=self.pk).first()
+        if duplicate_route:
+            raise ValidationError(
+                f"A bot with route {self.route!r} already exists for company "
+                f"{self.company} ({duplicate_route}). Routes must be unique per "
+                f"company — lookups like CompanyBot.objects.filter(route=..., "
+                f"company=...).first() silently pick the wrong bot otherwise."
+            )
+
         update_fields = kwargs.get('update_fields')
+        reset_fields = set()
+        if self._sync_vector_search_tool():
+            reset_fields |= {'tool_context'}
         gateway_fields_changing = update_fields is None or {'gateway_provider', 'gateway_model'} & set(update_fields)
         if self.pk and gateway_fields_changing:
             old = CompanyBot.objects.filter(pk=self.pk).only('gateway_provider', 'gateway_model').first()
-            reset_fields = set()
             if old and old.gateway_provider != self.gateway_provider:
                 self.gateway_model = None
                 self.gateway_sub_provider = None
-                reset_fields = {'gateway_model', 'gateway_sub_provider'}
+                reset_fields |= {'gateway_model', 'gateway_sub_provider'}
             elif old and old.gateway_model != self.gateway_model:
                 self.gateway_sub_provider = None
-                reset_fields = {'gateway_sub_provider'}
-            # update_fields only persists what's listed — make sure resets we just made
-            # in memory are actually included, otherwise they'd be silently dropped.
-            if update_fields is not None and reset_fields:
-                kwargs['update_fields'] = list(set(update_fields) | reset_fields)
+                reset_fields |= {'gateway_sub_provider'}
+
+        had_cache_values = bool(self.cache_ttl or self.cache_targets)
+        self.clean()
+        if had_cache_values and not self.enable_cache:
+            reset_fields |= {'cache_ttl', 'cache_targets'}
+
+        # update_fields only persists what's listed — make sure resets we just made
+        # in memory are actually included, otherwise they'd be silently dropped.
+        if update_fields is not None and reset_fields:
+            kwargs['update_fields'] = list(set(update_fields) | reset_fields)
         super().save(*args, **kwargs)
 
     class Meta:
@@ -304,24 +414,62 @@ class CompanyChatFeedback(models.Model):
         return f'Feedback #{self.id} for CompanyChat #{self.company_chat_id}'
 
 
+class VoiceManager(models.Manager):
+    """Excludes Voice rows that only exist as another row's fallback config."""
+
+    def get_queryset(self):
+        return super().get_queryset().filter(is_fallback=False)
+
+
 class Voice(models.Model):
     """
     Defines a text-to-speech voice configuration for a company bot.
     Stores provider details, language, gender, and playback settings.
+
+    A row can optionally be a fallback config for another (primary) Voice row,
+    via `primary_voice` — used to retry translation with a different provider
+    if the primary one errors. `is_fallback` is derived automatically from
+    `primary_voice` (see save()) and is the authoritative DB-level marker of
+    which rows are fallback configs vs. real/primary provider rows. Type and
+    company_bot are mirrored from the primary row automatically; language must
+    be entered explicitly and is validated to match the primary row's language.
     """
 
     company_bot = models.ForeignKey(CompanyBot, on_delete=models.SET_NULL, null=True, blank=True)
     type = models.CharField(max_length=300, choices=VoiceType.choices, null=True, blank=True)
-    provider = models.CharField(max_length=300, null=True, blank=True,
-                                choices=VoiceProvider.choices, default=VoiceProvider.AI4Bharat)
+    provider = models.CharField(
+        max_length=300, null=True, blank=True, choices=VoiceProvider.choices, default=VoiceProvider.AI4Bharat,
+        help_text="Legacy — frozen, hidden from admin, auto-synced from provider_ref on save(). "
+                   "Kept only for backward compatibility with existing read call sites."
+    )
     name = models.CharField(max_length=100, null=True, blank=True)
     sample_link = models.URLField(null=True, blank=True)
-    language = models.CharField(max_length=100, null=True, blank=True)
+    language = models.CharField(
+        max_length=100, null=True, blank=True,
+        help_text="Legacy — frozen, hidden from admin, auto-synced from language_ref on save(). "
+                   "Kept only for backward compatibility with existing read call sites."
+    )
     provider_code = models.CharField(max_length=100, null=True, blank=True)
+    language_ref = models.ForeignKey(
+        'chatbot.Language', on_delete=models.PROTECT, related_name='voices',
+        help_text="Structured language for this voice config."
+    )
+    provider_ref = models.ForeignKey(
+        'chatbot.Provider', on_delete=models.PROTECT, related_name='voices',
+        help_text="Structured provider for this voice config."
+    )
     gender = models.CharField(max_length=100, choices=GenderChoices.choices, default=GenderChoices.MALE)
     voice_speed = models.FloatField(
         null=True, blank=True, default=1.0,
         validators=[MinValueValidator(0.25), MaxValueValidator(4.0)]
+    )
+    primary_voice = models.OneToOneField(
+        'self', on_delete=models.CASCADE, null=True, blank=True, related_name='fallback_config',
+        help_text="Set only on a row that is a fallback config for a Text To Text primary row."
+    )
+    is_fallback = models.BooleanField(
+        default=False, editable=False,
+        help_text="Auto-derived from primary_voice — True for a row that is a fallback config."
     )
 
     other_params = models.JSONField(null=True, blank=True)
@@ -330,18 +478,110 @@ class Voice(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = VoiceManager()
+    all_voices = models.Manager()
+
     def __str__(self):
-        return f"{self.provider}-{self.type}"
+        return f"{self.get_provider_display()} - {self.get_type_display()} - {self.language}"
+
+    @property
+    def provider_slug(self):
+        """Slug used to key into the provider_dispatch registries — reads provider_ref when set,
+        falling back to mapping the legacy provider enum value for rows not yet backfilled."""
+        if self.provider_ref_id:
+            return self.provider_ref.slug
+        return VOICE_PROVIDER_TO_SLUG.get(self.provider)
+
+    def _sync_legacy_fields_from_refs(self):
+        """Sync legacy language/provider CharFields from language_ref/provider_ref.
+
+        Called from both clean() and save() — clean()'s uniqueness/fallback-match
+        checks below read the legacy `language` field, and clean() runs (via
+        full_clean(), e.g. from admin forms) before save(), so the sync can't only
+        live in save() or those checks would see a stale/blank legacy value for a
+        row created via the FK fields alone.
+        """
+        if self.language_ref_id:
+            self.language = self.language_ref.iso_code
+        if self.provider_ref_id:
+            self.provider = SLUG_TO_VOICE_PROVIDER.get(self.provider_ref.slug, self.provider)
+
+    def clean(self):
+        super().clean()
+        self._sync_legacy_fields_from_refs()
+
+        if not self.primary_voice_id:
+            # A primary/non-fallback row — at most one per (company_bot, type,
+            # language), regardless of provider. Matches the single-row lookup
+            # get_voice_provider() (and the ~40 similar lookups across the app)
+            # has always assumed but never enforced.
+            duplicate = Voice.objects.filter(
+                company_bot=self.company_bot, type=self.type, language=self.language,
+            ).exclude(pk=self.pk).first()
+            if duplicate:
+                raise ValidationError(
+                    f"A {self.get_type_display()} voice for language {self.language!r} already exists "
+                    f"({duplicate}). Only one entry per type and language is allowed per bot, "
+                    f"regardless of provider."
+                )
+            return
+
+        if self.primary_voice_id == self.pk:
+            raise ValidationError("A fallback voice cannot reference itself as its primary voice.")
+
+        if self.primary_voice.type != VoiceType.TextToText:
+            raise ValidationError("A fallback voice can only be set for a Text To Text (translation) row.")
+
+        if self.primary_voice.is_fallback:
+            raise ValidationError("Cannot set a fallback under another fallback row (only one level is supported).")
+
+        other_fallback = Voice.all_voices.filter(
+            primary_voice_id=self.primary_voice_id
+        ).exclude(pk=self.pk).first()
+        if other_fallback:
+            raise ValidationError(
+                f"'{self.primary_voice}' already has a fallback voice configured ({other_fallback}). "
+                f"Edit or delete that row instead of adding another — only one fallback per primary voice "
+                f"is supported."
+            )
+
+        if self.primary_voice.provider == self.provider:
+            raise ValidationError("Fallback voice must use a different provider than the primary voice.")
+
+        if self.language != self.primary_voice.language:
+            raise ValidationError(
+                f"Fallback voice language ({self.language!r}) must match the primary voice's "
+                f"language ({self.primary_voice.language!r})."
+            )
 
     def save(self, *args, **kwargs):
 
         if self.other_params == "null":
             self.other_params = None
 
+        self._sync_legacy_fields_from_refs()
+
+        self.is_fallback = bool(self.primary_voice_id)
+
+        # A fallback config row mirrors its primary row's type/bot — language is
+        # entered explicitly and validated (see clean()) to match the primary's.
+        if self.primary_voice_id:
+            primary_company_bot_id = self.primary_voice.company_bot_id
+            # Guard against a caller (e.g. bulk import) explicitly setting
+            # company_bot to something other than the primary voice's own bot —
+            # silently trusting primary_voice's company here would let an
+            # imported row get cross-tenant reattached to another company's bot.
+            if self.company_bot_id and self.company_bot_id != primary_company_bot_id:
+                raise ValueError(
+                    "primary_voice must belong to the same company_bot as this Voice row."
+                )
+            self.type = self.primary_voice.type
+            self.company_bot_id = primary_company_bot_id
+
         defaults = VOICE_PROVIDER_DEFAULTS.get(self.provider, {}).get(self.type, {})
 
         if self.pk:
-            old = Voice.objects.filter(pk=self.pk).first()
+            old = Voice.all_voices.filter(pk=self.pk).first()
 
             # If provider or type changed → reset config
             if old and (old.provider != self.provider or old.type != self.type):
@@ -354,11 +594,31 @@ class Voice(models.Model):
         super().save(*args, **kwargs)
 
     class Meta:
+        # validate_unique() (and other Django internals) use _default_manager, not
+        # _base_manager, to exclude "self" from conflict checks — if that manager
+        # is the filtered one, a fallback row (excluded from it) can never exclude
+        # itself, producing bogus "not a valid choice" errors on an untouched save.
+        # Both must point at the unfiltered manager for Voice's internals to work
+        # correctly; application code should still use the explicit `objects` /
+        # `all_voices` manager names, which are unaffected by these Meta options.
+        default_manager_name = 'all_voices'
+        base_manager_name = 'all_voices'
         indexes = [
             models.Index(fields=['company_bot']),
             models.Index(fields=['created_at']),
             models.Index(fields=['type']),
             models.Index(fields=['provider']),
+        ]
+        constraints = [
+            # DB-level backstop for the same rule enforced in clean() — catches
+            # raw .create()/bulk_create() paths (e.g. bulk import) that bypass
+            # form validation. Fallback rows (is_fallback=True) are excluded
+            # since they're expected to share (type, language) with their primary.
+            models.UniqueConstraint(
+                fields=['company_bot', 'type', 'language'],
+                condition=models.Q(is_fallback=False),
+                name='unique_primary_voice_per_bot_type_language',
+            ),
         ]
 
 
@@ -645,12 +905,6 @@ class Flow(models.Model):
         related_name='flows',
         help_text="Image configuration settings for this flow."
     )
-    create_story = models.CharField(
-        max_length=20,
-        choices=CreateStoryChoices.choices,
-        default=CreateStoryChoices.ALL,
-        help_text="Whether to post process the story or not"
-    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -735,4 +989,72 @@ class PDFTemplates(models.Model):
         indexes = [
             models.Index(fields=['template_name']),
             models.Index(fields=['user_type']),
+        ]
+
+
+def get_media_template_upload_path(instance, filename):
+    # Only reachable once `instance.id` exists - the admin only shows/allows
+    # template_file on the change form (after the row's first save with just
+    # flow+type+template_name), never on the initial add form.
+    return f"media_template/{instance.type}/{instance.id}/{filename}"
+
+
+class MediaTemplate(models.Model):
+    """
+    Generalized template for generating a downloadable document (PDF, DOCX, ...)
+    for a flow. One row per (flow, type) - unlike PDFTemplates this covers any
+    output format, since PDF (inline HTML/Jinja2 text) and DOCX (an uploaded
+    .docx file rendered via docxtpl) need structurally different "template"
+    storage. `type` decides which of `template`/`template_file` is used;
+    everything else (constants_json, flow) is shared/format-agnostic.
+    """
+    type = models.CharField(
+        max_length=10,
+        choices=MediaTemplateType.choices,
+        help_text="Output format this template produces."
+    )
+    template_name = models.CharField(
+        max_length=255,
+        unique=True,
+        help_text="Unique name identifier for this template."
+    )
+    flow = models.ForeignKey(
+        Flow,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='media_templates',
+        help_text="Flow associated with this template."
+    )
+    constants_json = models.JSONField(
+        null=True,
+        blank=True,
+        help_text="JSON object containing constants/variables used in the template."
+    )
+    template = models.TextField(
+        null=True,
+        blank=True,
+        help_text="Template content (HTML/Jinja2) - used when type=PDF."
+    )
+    template_file = models.FileField(
+        upload_to=get_media_template_upload_path,
+        max_length=1000,
+        null=True,
+        blank=True,
+        help_text="Uploaded .docx template (Jinja2 tags via docxtpl) - used when type=DOCX."
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    history = HistoricalRecords()
+
+    def __str__(self):
+        return f"{self.template_name} ({self.type})"
+
+    class Meta:
+        verbose_name = "Media Template"
+        verbose_name_plural = "Media Templates"
+        indexes = [
+            models.Index(fields=['template_name']),
+            models.Index(fields=['type']),
         ]

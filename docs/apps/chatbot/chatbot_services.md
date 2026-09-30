@@ -4,6 +4,14 @@
 
 The chatbot core services coordinate essential functions like session management, message preparations, prompt building, and orchestration of chatbot workflows to provide responsive conversational experiences.
 
+This page covers the orchestration layer under `chatbot/services/core/`. The
+response-generation layer it delegates into — `services/response_handlers/`
+(`BaseResponseHandler`, `CommonResponseHandler`), plus the supporting
+`services/preprocessing/` and `services/postprocessing/` services — is
+documented in depth in [WebSocket Response Handling](chatbot_response_handlers.md),
+since that layer holds the bulk of the conversational logic and warrants its
+own dedicated reference.
+
 ## Key Services in Detail
 
 ### BaseChatService
@@ -43,7 +51,7 @@ Responsible for generating system prompt content:
 
 Employs factory pattern for creating bot strategy instances:
 
-- Supports known bot strategies including 'oneshot', 'guided_guest', 'guest_discussion', and 'common'.
+- Only registers `'common'` (`CommonBotStrategy`) — the `oneshot`/`guided_guest`/`guest_discussion` strategies were removed (see [Strategies](chatbot_strategies.md); every websocket session connects through the single `ws/common/` route and `AsyncSocketConsumer` hardcodes `bot_type='common'` on its call into this factory, so those other branches were unreachable regardless of what a `CompanyBot.strategy` field says).
 - Allows dynamic extension by registering additional bot strategy classes.
 
 This service layer delivers the foundation enabling versatile chatbot operations supporting multiple interaction designs.
@@ -89,7 +97,7 @@ These services are primarily located in `chatbot/services/core/`.
 ## BotServiceFactory
 
 - Factory class to instantiate the appropriate bot strategy based on bot type.
-- Maps bot types like 'oneshot', 'guided_guest', 'guest_discussion', and 'common' to their strategy classes.
+- Only maps `'common'` to `CommonBotStrategy` — the other historical strategy types were removed as unreachable dead code.
 - Methods:
   - `create_bot_service(bot_type, route=None, extra_params=None)`
   - `register_strategy(bot_type, strategy_class)` to add new strategies.

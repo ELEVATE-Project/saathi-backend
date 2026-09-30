@@ -5,8 +5,12 @@
 Chatbot document PDFs (e.g. the MIP "Improvement Plan") are rendered by a separate
 **Gotenberg** service (headless Chromium). The Django app POSTs HTML to it via
 `GOTENBERG_URL` (`.../forms/chromium/convert/html`). The HTML template and its
-localized labels live in the **database** (`PDFTemplates`, `template_name='MIP'`),
-not in the repo.
+localized labels live in the **database** (`MediaTemplate`, `type='PDF'`,
+`template_name='MIP'`), not in the repo. `MediaTemplate` replaced the older
+`PDFTemplates` model as the live source for this render path — see
+[Utils](../apps/chatbot/chatbot_utils.md#media-templates-and-document-generation);
+`PDFTemplates` rows still exist in the DB but are no longer read by any live
+render path, so editing them has no effect on generated PDFs.
 
 **Symptom this doc prevents:** non-English labels (Tamil / Hindi / Kannada / Odia)
 render as tofu boxes (□) in the PDF while English renders fine. DOCX is unaffected.
@@ -24,6 +28,23 @@ Non-Latin text renders **only if both** of these are true. Fixing just one is no
 
 Fallback is per-character: Latin stays on Arial/Georgia; only Indic characters fall
 through to the Noto font named later in the stack.
+
+## Known issue: Odia matra/candrabindu shaping (Noto Sans Oriya)
+
+Separately from the tofu problem above, **Noto Sans Oriya** has a text-shaping bug:
+the ି (ORIYA VOWEL SIGN I, U+0B3F) + ଁ (CANDRABINDU, U+0B01) sequence — e.g. in
+"ନାହିଁ" — renders with the mark floating/misplaced instead of composing onto its
+base consonant. This happens even with the glyph correctly installed and named; it's
+a font-internal shaping defect exposed by Chromium, not a missing-font or CSS issue.
+Confirmed by reproducing it in isolation (bare HTML, single word, direct to
+Gotenberg) — no template/CSS/content involvement.
+
+**Fix:** use **Anek Odia** (Google Fonts, OFL-licensed) instead of Noto Sans Oriya
+for Odia specifically. Same isolated test with Anek Odia renders the cluster
+correctly. It is not an apt package — install by downloading the file directly (see
+step 1). Keep `"Noto Sans Oriya"` in the stack *after* Anek Odia as a safety net for
+any character Anek Odia might lack; per-character fallback means it won't actually
+be used for Odia text since Anek Odia has full script coverage.
 
 ---
 
@@ -75,6 +96,8 @@ USER root
 RUN rm -f /etc/apt/sources.list.d/*chrome* \
     && apt-get update \
     && apt-get install -y --no-install-recommends fonts-noto-core \
+    && curl -L -o /usr/share/fonts/truetype/AnekOdia.ttf \
+       "https://raw.githubusercontent.com/google/fonts/main/ofl/anekodia/AnekOdia%5Bwdth%2Cwght%5D.ttf" \
     && fc-cache -f \
     && rm -rf /var/lib/apt/lists/*
 USER gotenberg
@@ -82,6 +105,10 @@ EOF
 
 sudo docker build -t gotenberg-noto:8 ~/gotenberg-custom
 ```
+
+> **Anek Odia isn't an apt package** — it's downloaded directly from the Google Fonts
+> GitHub repo (OFL-licensed). The `main` branch ref above can change over time; pin a
+> specific commit hash in the URL instead if you want this build to be reproducible.
 
 > **Note:** the `rm -f /etc/apt/sources.list.d/*chrome*` drops the base image's
 > Google Chrome apt repo before updating. That repo's signing key can be
@@ -167,15 +194,21 @@ in production:
 
 ```bash
 sudo docker exec -u root "$GC" sh -c \
-  "apt-get update && apt-get install -y --no-install-recommends fonts-noto-core && fc-cache -f"
+  "apt-get update && apt-get install -y --no-install-recommends fonts-noto-core \
+   && curl -L -o /usr/share/fonts/truetype/AnekOdia.ttf \
+      'https://raw.githubusercontent.com/google/fonts/main/ofl/anekodia/AnekOdia%5Bwdth%2Cwght%5D.ttf' \
+   && fc-cache -f"
 sudo docker restart "$GC"
 ```
+
+The restart is required either way — Chromium caches font enumeration at startup and
+won't pick up a newly-added font without it.
 
 ---
 
 ## 2. Name the fonts in the DB template CSS
 
-The `PDFTemplates.template` (name=`MIP`) has font stacks like `"Arial", sans-serif`.
+The `MediaTemplate.template` row (`type='PDF'`, name=`MIP`) has font stacks like `"Arial", sans-serif`.
 Add the Noto fonts after the Latin font so Indic characters resolve. One example:
 
 ```css
@@ -184,15 +217,19 @@ Add the Noto fonts after the Latin font so Indic characters resolve. One example
 
 /* after */
 .section-label {
-  font-family: "Arial", "Noto Sans Tamil", "Noto Sans Devanagari",
+  font-family: "Arial", "Anek Odia", "Noto Sans Tamil", "Noto Sans Devanagari",
                "Noto Sans Kannada", "Noto Sans Oriya", sans-serif;
 }
 ```
 
 Apply the same pattern to every font stack in the template (sans stacks get the
 `Noto Sans *` family; serif stacks get `Noto Serif *`, using `Noto Sans Oriya` for
-Oriya since there is no serif variant). To add another language later (e.g. Telugu),
-append `"Noto Sans Telugu"` / `"Noto Serif Telugu"` to the stacks.
+Oriya since there is no serif variant). `"Anek Odia"` is named *before*
+`"Noto Sans Oriya"` in every stack — it has full Odia script coverage so it handles
+all Odia text and avoids the shaping bug noted above; `"Noto Sans Oriya"` stays as a
+fallback for any character Anek Odia might lack, but per-character fallback means it
+won't actually be invoked for normal Odia content. To add another language later
+(e.g. Telugu), append `"Noto Sans Telugu"` / `"Noto Serif Telugu"` to the stacks.
 
 Applying the edit from the server:
 
@@ -200,15 +237,15 @@ Applying the edit from the server:
 cd ~/saathi-backend && python manage.py shell
 ```
 ```python
-from chatbot.models.company_models import PDFTemplates
-t = PDFTemplates.objects.get(template_name='MIP')
+from chatbot.models.company_models import MediaTemplate
+t = MediaTemplate.objects.get(template_name='MIP')  # type='PDF'
 t.template = (t.template
   .replace('"Arial", sans-serif',
-           '"Arial", "Noto Sans Tamil", "Noto Sans Devanagari", "Noto Sans Kannada", "Noto Sans Oriya", sans-serif')
+           '"Arial", "Anek Odia", "Noto Sans Tamil", "Noto Sans Devanagari", "Noto Sans Kannada", "Noto Sans Oriya", sans-serif')
   .replace('"Georgia", "Times New Roman", serif',
-           '"Georgia", "Times New Roman", "Noto Serif Tamil", "Noto Serif Devanagari", "Noto Serif Kannada", "Noto Sans Oriya", serif'))
+           '"Georgia", "Times New Roman", "Anek Odia", "Noto Serif Tamil", "Noto Serif Devanagari", "Noto Serif Kannada", "Noto Sans Oriya", serif'))
 t.save(update_fields=['template'])
-print('patched:', 'Noto Sans Tamil' in t.template)
+print('patched:', 'Anek Odia' in t.template)
 ```
 
 ---
@@ -217,7 +254,7 @@ print('patched:', 'Noto Sans Tamil' in t.template)
 
 ```bash
 # fonts present in the container?
-sudo docker exec "$GC" fc-list | grep -iE "tamil|devanagari|kannada|oriya"
+sudo docker exec "$GC" fc-list | grep -iE "tamil|devanagari|kannada|oriya|anek"
 ```
 
 End-to-end: trigger a non-English PDF download and confirm the labels render.
@@ -229,8 +266,13 @@ Liberation embedded; working = Noto embedded). `GOTENBERG_URL` lives in the app'
 ```bash
 export GOTENBERG_URL=$(grep -m1 '^GOTENBERG_URL=' ~/saathi-backend/.env | cut -d= -f2- | tr -d '"')
 curl -s -o out.pdf -F 'files=@test.html;filename=index.html' "$GOTENBERG_URL"
-strings out.pdf | grep -oiE "(Liberation|Noto)[A-Za-z]*" | sort -u
+strings out.pdf | grep -oiE "(Liberation|Noto|AnekOdia)[A-Za-z]*" | sort -u
 ```
+
+For Odia specifically, `AnekOdia` (not `NotoSansOriya`) should be the font actually
+embedded for the shaped ି/ଁ clusters — `NotoSansOriya` still appearing is not
+itself wrong (it's the fallback in the stack), but if it's the *only* Odia font
+embedded, Anek Odia likely isn't installed/named correctly.
 
 ---
 
@@ -241,4 +283,11 @@ strings out.pdf | grep -oiE "(Liberation|Noto)[A-Za-z]*" | sort -u
 - Both steps 1 and 2 are per-environment. Repeat on every server (dev/stage/prod).
 - The label text itself is clean Unicode; this is purely a font-availability +
   font-naming issue, which is why DOCX (rendered by python-docx, not Chromium) is
-  never affected.
+  never affected. The Odia matra/candrabindu issue is the one exception seen so
+  far — that one is a genuine font-shaping defect (Noto Sans Oriya), not a
+  font-availability/naming issue, which is why it needed a font swap (Anek Odia)
+  rather than an install/CSS fix.
+- `docker-compose.yml` in this repo currently pulls the stock `gotenberg/gotenberg:8`
+  image directly (no `build:` step) — the `gotenberg:` service block must be updated
+  to point at the custom `gotenberg-noto:8` image (or equivalent) per Case A above
+  for any of this to survive a redeploy.
