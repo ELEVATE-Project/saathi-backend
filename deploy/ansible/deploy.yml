@@ -1,0 +1,194 @@
+- name: Deploy Saathi service (uvicorn + celery)
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    project_path: /opt/deployment/backend/saathi-service
+    vault_token_path: /opt/deployment/.token
+    current_path: "{{ project_path }}/saathi-backend-service"
+    vault_address: "https://demo-vault-domain/v1/Dev_env/data/"
+    vault_env_path: "saathi_backend_env"
+    vault_secrets_path: "saathi_gcp_credentials"
+    uvicorn_host: "0.0.0.0"
+    uvicorn_port: 9000
+    uvicorn_workers: 4
+    ws_ping_interval: 30
+    ws_ping_timeout: 300
+
+    celery_pool: threads
+    celery_concurrency: 50
+    celery_prefetch_multiplier: 1
+    celery_loglevel: info
+
+  tasks:
+    - name: Build and deploy the new release
+      block:
+
+        - name: Compute this run's release path (once, cached as a fact)
+          set_fact:
+            release_timestamp: "{{ lookup('pipe', 'date +%Y%m%d%H%M%S') }}"
+
+        - name: Derive release_path from the frozen timestamp
+          set_fact:
+            release_path: "{{ project_path }}/releases/{{ release_timestamp }}"
+
+        - name: Create temporary release directory
+          file:
+            path: "{{ release_path }}"
+            state: directory
+            mode: "0755"
+            recurse: true
+
+        - name: Clone repository at the requested branch or tag
+          git:
+            repo: "{{ repo_url }}"
+            dest: "{{ release_path }}"
+            version: "{{ repo_ref }}"
+            force: true
+
+        - name: Ensure jq is installed (required to parse Vault's JSON response)
+          apt:
+            name: jq
+            state: present
+            update_cache: true
+
+        - name: Read the Vault token from disk
+          slurp:
+            src: "{{ vault_token_path }}"
+          register: vault_token_raw
+
+        - name: Ensure config directory exists for secrets.json
+          file:
+            path: "{{ release_path }}/config"
+            state: directory
+            mode: "0755"
+
+        - name: DEBUG - TEMPORARY - print secrets.json Vault URL
+          debug:
+            msg: "{{ vault_address }}{{ vault_secrets_path }}"
+
+        - name: Fetch secrets.json from Vault
+          shell: >
+            curl --silent --insecure --location --request GET
+            '{{ vault_address }}{{ vault_secrets_path }}'
+            --header 'X-Vault-Token: {{ vault_token_raw.content | b64decode | trim }}'
+            | jq '.data.data' > {{ release_path }}/config/secrets.json
+          args:
+            creates: "{{ release_path }}/config/secrets.json"
+
+        - name: Install Python dependencies with uv
+          command: uv sync --frozen
+          args:
+            chdir: "{{ release_path }}"
+
+        - name: Delete old live directory
+          file:
+            path: "{{ current_path }}"
+            state: absent
+
+        - name: Recreate live directory (empty)
+          file:
+            path: "{{ current_path }}"
+            state: directory
+            mode: "0755"
+
+        - name: Move release contents into the live directory
+          shell: "mv {{ release_path }}/* {{ current_path }}/"
+
+        - name: Ensure json2env.sh is executable
+          file:
+            path: "{{ current_path }}/scripts/json2env.sh"
+            mode: "0755"
+
+        - name: DEBUG - TEMPORARY - print .env Vault URL
+          debug:
+            msg: "{{ vault_address }}{{ vault_env_path }}"
+
+        - name: Fetch env config from Vault and write .env
+          shell: >
+            curl --silent --insecure --location --request GET
+            '{{ vault_address }}{{ vault_env_path }}'
+            --header 'X-Vault-Token: {{ vault_token_raw.content | b64decode | trim }}'
+            | jq '.data.data'
+            | {{ current_path }}/scripts/json2env.sh > {{ current_path }}/.env
+          args:
+            creates: "{{ current_path }}/.env"
+
+        - name: Ensure logs directory exists inside the app directory
+          file:
+            path: "{{ current_path }}/logs"
+            state: directory
+            mode: "0755"
+
+        - name: Run Django migrations
+          command: uv run python manage.py migrate --noinput
+          args:
+            chdir: "{{ current_path }}"
+
+        - name: Remove the now-empty temporary release directory
+          file:
+            path: "{{ release_path }}"
+            state: absent
+
+        - name: Template the uvicorn systemd unit
+          template:
+            src: templates/saathi-uvicorn.service.j2
+            dest: /etc/systemd/system/saathi-uvicorn.service
+            mode: "0644"
+
+        - name: Template the celery systemd unit
+          template:
+            src: templates/saathi-celery.service.j2
+            dest: /etc/systemd/system/saathi-celery.service
+            mode: "0644"
+
+        - name: Reload systemd daemon (pick up any unit file changes)
+          systemd:
+            daemon_reload: true
+
+        - name: Enable and restart saathi-uvicorn
+          systemd:
+            name: saathi-uvicorn
+            enabled: true
+            state: restarted
+
+        - name: Enable and restart saathi-celery
+          systemd:
+            name: saathi-celery
+            enabled: true
+            state: restarted
+
+        - name: DEBUG - TEMPORARY - print health check URL
+          debug:
+            msg: "http://localhost:{{ uvicorn_port }}/health/"
+
+        - name: Health check the new deployment
+          uri:
+            url: "http://localhost:{{ uvicorn_port }}/health/"
+            status_code: 200
+            timeout: 10
+          register: health_result
+          retries: 20
+          delay: 5
+          until: health_result.status is defined and health_result.status == 200
+
+        - name: DEBUG - TEMPORARY - print health check response
+          debug:
+            msg: "status={{ health_result.status | default('n/a') }} body={{ health_result.json | default(health_result.content | default('n/a')) }}"
+
+      rescue:
+        - name: Clean up the temporary release directory after failure
+          file:
+            path: "{{ release_path }}"
+            state: absent
+
+        - name: Re-fail the play now that cleanup is done
+          fail:
+            msg: >-
+              Deploy failed - see the failed task's output above this
+              message for the real error. The temporary release directory
+              has been cleaned up. If the failure occurred after the
+              old live directory was deleted (STEP 4), current_path may be
+              missing or partially replaced - manual investigation required,
+              there is no automatic rollback.
