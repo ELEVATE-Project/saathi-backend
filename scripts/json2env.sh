@@ -1,3 +1,4 @@
+#!/bin/bash
 set -euo pipefail
 jq -r 'to_entries | map(
     "\(.key)=" + (
