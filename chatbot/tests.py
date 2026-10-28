@@ -78,11 +78,17 @@ class WebSearchFallbackTests(SimpleTestCase):
         self.assertNotEqual(second['messages'][-1]['role'], 'assistant')
         self.assertIn('web_search_options', second['params'])
 
-    def test_notes_do_not_order_a_web_search(self):
-        for chunks in ([], [CHUNK]):
-            with self.subTest(kb_chunks=len(chunks)):
-                _, tool_result = self.run_turn(chunks=chunks)
-                self.assertNotIn('call the web_search tool now', tool_result)
+    def test_kb_hit_note_offers_web_only_as_fallback(self):
+        _, tool_result = self.run_turn(chunks=[CHUNK])
+        self.assertNotIn('call the web_search tool now', tool_result)
+        self.assertIn('web search is available as a fallback', tool_result)
+
+    def test_kb_empty_note_gives_h06_order(self):
+        # H06: KB first, then web, then general knowledge with a note.
+        _, tool_result = self.run_turn(chunks=[])
+        self.assertNotIn('call the web_search tool now', tool_result)
+        self.assertIn('Use web search to answer it', tool_result)
+        self.assertIn("not from Saathi's material or the web", tool_result)
 
     def test_kb_empty_web_off_says_answer_is_not_from_saathi_material(self):
         second, tool_result = self.run_turn(chunks=[], enable_web_search=False)
