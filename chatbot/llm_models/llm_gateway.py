@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 
 import requests
 
@@ -10,12 +11,25 @@ _API_KEY = os.getenv('LLM_GATEWAY_API_KEY', '')
 _TENANT_ID = os.getenv('LLM_GATEWAY_TENANT_ID', '')
 
 
+# Claude 5.x models with thinking on reject sampling fields such as temperature (T31).
+# Matches both 'claude-haiku-5-5' and the OpenRouter slug 'anthropic/claude-haiku-5.5'.
+_NO_SAMPLING_MODEL = re.compile(r'claude-(?:haiku|sonnet|opus|fable)-5[.-]')
+
+
+def model_rejects_sampling_params(model) -> bool:
+    return bool(model) and bool(_NO_SAMPLING_MODEL.search(model))
+
+
 def build_gateway_params(company_bot) -> dict:
     params = {}
     if company_bot.max_token is not None:
         params['max_tokens'] = company_bot.max_token
     if company_bot.bot_temperature is not None:
-        params['temperature'] = company_bot.bot_temperature
+        _, model = get_effective_provider_model(company_bot)
+        if model_rejects_sampling_params(model):
+            logger.warning(f'[gateway] bot_temperature ignored: {model} does not accept temperature')
+        else:
+            params['temperature'] = company_bot.bot_temperature
     if company_bot.connect_timeout is not None:
         params['connect_timeout'] = company_bot.connect_timeout
     if company_bot.read_timeout is not None:
@@ -25,6 +39,11 @@ def build_gateway_params(company_bot) -> dict:
         params['stop'] = other['stop']
     if other.get('seed') is not None:
         params['seed'] = other['seed']
+    # Haiku 5.5: e.g. {"thinking": {"type": "adaptive"}, "output_config": {"effort": "low"}}
+    if other.get('thinking') is not None:
+        params['thinking'] = other['thinking']
+    if other.get('output_config') is not None:
+        params['output_config'] = other['output_config']
     provider_options = other.get('provider_options')
     if provider_options is None and company_bot.gateway_provider == 'openrouter' and company_bot.gateway_sub_provider:
         # No explicit provider_options override — derive one from gateway_sub_provider so
