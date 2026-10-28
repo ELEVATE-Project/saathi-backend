@@ -26,8 +26,6 @@ class BaseResponseHandler(ABC):
         self.default_error_message = 'I am sorry, I could not understood completely. Could you rephrase this please?'
         self.preprocessing_service = PreprocessingService()
         self.postprocessing_service = PostprocessingService()
-        self.min_word_count = 3
-        self.max_retry_attempts = 2
         self._executable_tools = {'search_knowledge_base'}
         self._gateway_handled_tools = {'web_search'}
         self._metadata_tools = {'respond_to_user'}
@@ -42,39 +40,11 @@ class BaseResponseHandler(ABC):
             logger.error("Failed to fetch BotVernacular for language=%s: %s", language, e)
         return self.default_error_message, False
 
-    def _is_response_too_short(self, response):
-        """
-        Check if response is too short (less than 3 words).
-        Returns True if response needs to be regenerated.
-        """
-        try:
-            if not response or response == '':
-                return False
-
-            if isinstance(response, dict):
-                response_text = response.get('response', '')
-                if not response_text:
-                    return False
-            else:
-                response_text = str(response)
-
-            response_text = response_text.strip()
-            if not response_text:
-                return False
-
-            word_count = len(response_text.split())
-
-            logger.info(f"Response word count: {word_count}, text: '{response_text[:100]}...'")
-
-            if word_count < self.min_word_count:
-                logger.info(f"Response too short: {word_count} words (minimum: {self.min_word_count})")
-                return True
-
-            return False
-
-        except Exception as e:
-            logger.error(f"Error checking response length: {e}")
-            return False
+    def _log_if_truncated(self, finish_reason, session_id):
+        """Log a reply cut off by the token limit. It is sent as it is, with no retry (T07)."""
+        # The gateway passes 'length' (LiteLLM, OpenAI style) or 'max_tokens' (Anthropic direct).
+        if finish_reason in ('length', 'max_tokens'):
+            logger.warning(f'[gateway] reply truncated by max_tokens (finish_reason={finish_reason}) session={session_id}')
 
     def is_non_llm_state(self, state_machine):
         return (
@@ -431,6 +401,7 @@ class BaseResponseHandler(ABC):
             if not (isinstance(response_data, dict) and 'function_call' in response_data):
                 if isinstance(extra, dict) and extra.pop('_respond_to_user_handled', False):
                     if not response_data and not empty_respond_to_user_retried:
+                        # TODO(T04): tag this extra call call_kind=retry once T04's call metadata is merged.
                         empty_respond_to_user_retried = True
                         logger.info('[tool_loop] respond_to_user called with no text — retrying with correction')
                         current_messages = list(current_messages) + [
@@ -592,6 +563,7 @@ class BaseResponseHandler(ABC):
             choice = data.get('choices', [{}])[0]
             message = choice.get('message', {})
             finish_reason = choice.get('finish_reason')
+            self._log_if_truncated(finish_reason, session_id)
             tool_calls = message.get('tool_calls') or []
 
             executable_tc = next(
@@ -711,6 +683,7 @@ class BaseResponseHandler(ABC):
                     finish_reason = chunk_finish_reason
                 if chunk_finish_data:
                     finish_chunk = chunk_finish_data
+            self._log_if_truncated(finish_reason, session_id)
 
             usage_cost = self._extract_usage_cost(finish_chunk)
             if usage_cost:

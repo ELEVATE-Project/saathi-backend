@@ -217,12 +217,7 @@ class CommonResponseHandler(BaseResponseHandler):
         return is_function_call
 
     def process_response(self, response, chat_session, chunks, streaming_completed=False, **kwargs):
-        """Process common response with retry logic for short responses"""
-        print(f"DEBUG: Starting process_response with response type: {type(response)}")
-        print(f"DEBUG: Response preview: {str(response)[:200]}...")
-        print(f"DEBUG: kwargs keys: {list(kwargs.keys())}")
-        print(f"DEBUG: streaming_completed in kwargs: {'streaming_completed' in kwargs}")
-        print(f"DEBUG: streaming_completed value: {kwargs.get('streaming_completed', 'NOT SET')}")
+        """Process a common response. A short reply is sent as it is: no word-count retry (T07)."""
 
         # Route non-state-machine function calls to the appropriate handler.
         _freeflow_action_tools = {'download_file'}
@@ -236,9 +231,6 @@ class CommonResponseHandler(BaseResponseHandler):
                 return self._handle_json_tool_response(response, chat_session, chunks, **kwargs)
             elif fc_name in _profile_tools:
                 return self._handle_profile_tool_response(response, chat_session, chunks, **kwargs)
-
-        retry_attempt = kwargs.get('retry_attempt', 0)
-        print(f"DEBUG: Current retry attempt: {retry_attempt}")
 
         skip_llm_call = kwargs.get('skip_llm', False)
         send_bot_question = kwargs.get('send_bot_question', False)
@@ -268,54 +260,7 @@ class CommonResponseHandler(BaseResponseHandler):
             print(f"DEBUG: expected_output_response: '{expected_output_response}'")
             print(f"DEBUG: reason_text: '{reason_text}'")
 
-            if not is_function_call and retry_attempt < self.max_retry_attempts:
-                response_to_check = expected_output_response if expected_output_response is not None else response
-
-                if self._is_response_too_short(response_to_check):
-                    logger.info(
-                        f"Response too short, retrying LLM call (attempt {retry_attempt + 1}/{self.max_retry_attempts})")
-                    print(
-                        f"DEBUG: Response too short, retrying LLM call (attempt {retry_attempt + 1}/{self.max_retry_attempts})")
-
-                    kwargs['retry_attempt'] = retry_attempt + 1
-
-                    try:
-                        result = self.get_llm_response(**kwargs)
-
-                        if isinstance(result, tuple):
-                            new_response, extra_content, finish_reason = result
-                        else:
-                            new_response = result
-                            finish_reason = None
-
-                        if new_response:
-                            logger.info("Successfully got new response from LLM on retry")
-                            print("DEBUG: Successfully got new response from LLM on retry")
-
-                            return self.process_response(
-                                new_response, chat_session, chunks,
-                                streaming_completed=streaming_completed,
-                                **kwargs
-                            )
-                        else:
-                            logger.info("LLM returned None on retry, will use error message")
-                            print("DEBUG: LLM returned None on retry, will use error message")
-                            kwargs['use_error_message'] = True
-
-                    except Exception as e:
-                        logger.error(f"Error during LLM retry: {e}")
-                        print(f"DEBUG: Error during LLM retry: {e}")
-                        kwargs['use_error_message'] = True
-
-            if not is_function_call and retry_attempt >= self.max_retry_attempts:
-                response_to_check = expected_output_response if expected_output_response is not None else response
-                if self._is_response_too_short(response_to_check):
-                    logger.info("Exhausted all retries, response still too short, will use error message")
-                    print("DEBUG: Exhausted all retries, response still too short, will use error message")
-                    kwargs['use_error_message'] = True
-
         company_bot = kwargs['company_bot']
-        language = kwargs['language']
 
         forward_kwargs = kwargs.copy()
 
@@ -323,14 +268,6 @@ class CommonResponseHandler(BaseResponseHandler):
         forward_kwargs['skip_next_stage'] = kwargs.get('skip_next_stage', False)
         forward_kwargs['target_stage'] = kwargs.get('target_stage', False)
         forward_kwargs['skip_next_stage_preprocessing'] = kwargs.get('skip_next_stage_preprocessing', False)
-
-        if kwargs.get('use_error_message', False) and not is_function_call:
-            error_message, is_vernacular = self.get_error_message(company_bot, language)
-            logger.info(f"Using error message: {error_message}")
-            print(f"DEBUG: Using error message: {error_message}")
-            expected_output_response = error_message
-            response = error_message
-            kwargs['is_bot_vernacular_message'] = is_vernacular
 
         # Handle function calls for STATE_MACHINE bots
         if is_function_call and company_bot and company_bot.bot_type == CompanyBotTypeChoices.STATE_MACHINE:
