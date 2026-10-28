@@ -3,7 +3,9 @@ from unittest import mock
 
 from django.test import SimpleTestCase
 
+from chatbot.models import CompanyBotTypeChoices
 from chatbot.services.response_handlers.base_response_handler import BaseResponseHandler
+from chatbot.services.response_handlers.common_handler import CommonResponseHandler
 
 HANDLER_MODULE = 'chatbot.services.response_handlers.base_response_handler'
 
@@ -94,3 +96,100 @@ class WebSearchFallbackTests(SimpleTestCase):
         second, tool_result = self.run_turn(chunks=[], enable_web_search=False)
         self.assertNotIn('web_search_options', second['params'])
         self.assertIn("not from Saathi's material", tool_result)
+
+
+def _gateway_patches(gateway=None, stream=None):
+    """Patch the gateway and its helpers in the base handler module; returns a list of patchers."""
+    patches = [
+        mock.patch(f'{HANDLER_MODULE}.build_gateway_params', side_effect=lambda _bot: {}),
+        mock.patch(f'{HANDLER_MODULE}.get_effective_provider_model', return_value=('anthropic', 'm')),
+        mock.patch(f'{HANDLER_MODULE}.save_in_company_db'),
+        mock.patch.object(BaseResponseHandler, '_send_chunk'),
+        mock.patch.object(BaseResponseHandler, '_save_finalized_sources'),
+    ]
+    if gateway is not None:
+        patches.append(mock.patch(f'{HANDLER_MODULE}.call_llm_gateway', gateway))
+    if stream is not None:
+        patches.append(mock.patch(f'{HANDLER_MODULE}.call_llm_gateway_stream', stream))
+    return patches
+
+
+def _call_turn(bot, patches, channel_name=None):
+    for p in patches:
+        p.start()
+    try:
+        return _Handler()._handle_gateway_response(
+            system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+            company_bot=bot, session_id='s1', profile_id=None, tools=None, channel_name=channel_name,
+        )
+    finally:
+        for p in reversed(patches):
+            p.stop()
+
+
+class ShortReplyTests(SimpleTestCase):
+    """T07: a short but valid reply is sent as it is, without a retry."""
+
+    def test_one_word_reply_is_sent_as_is(self):
+        for streamed in (False, True):
+            with self.subTest(streamed=streamed):
+                handler = CommonResponseHandler()
+                bot = SimpleNamespace(bot_type=CompanyBotTypeChoices.SIMPLE, stream=streamed)
+                with mock.patch.object(handler, 'get_llm_response') as llm, \
+                        mock.patch.object(handler, '_handle_regular_response', return_value='sent') as send:
+                    result = handler.process_response(
+                        'Thanks!', SimpleNamespace(current_step=1), [], streaming_completed=streamed,
+                        company_bot=bot, language='en', messages=[],
+                    )
+                self.assertEqual(result, 'sent')
+                llm.assert_not_called()
+                self.assertEqual(send.call_args.kwargs['response'], 'Thanks!')
+
+
+class TruncatedReplyTests(SimpleTestCase):
+    """T07: a reply cut off by the token limit is logged, sent as it is, and not retried."""
+
+    def test_non_stream_cut_off_reply_is_logged_not_retried(self):
+        for reason in ('length', 'max_tokens'):
+            with self.subTest(reason=reason):
+                gateway = mock.Mock(return_value={
+                    'choices': [{'message': {'content': 'Step 1: fold the'}, 'finish_reason': reason}],
+                })
+                bot = SimpleNamespace(enable_web_search=False, stream=False, other_params={})
+                with self.assertLogs('django', level='WARNING') as logs:
+                    result = _call_turn(bot, _gateway_patches(gateway=gateway))
+                self.assertEqual(result[0], 'Step 1: fold the')
+                self.assertEqual(gateway.call_count, 1)
+                self.assertTrue(any('truncated' in line for line in logs.output))
+
+    def test_stream_cut_off_reply_is_logged_not_retried(self):
+        stream = mock.Mock(return_value=iter([
+            ('Step 1: fold the', None, None, None, None),
+            (None, None, 'length', None, None),
+        ]))
+        bot = SimpleNamespace(enable_web_search=False, stream=True, other_params={})
+        with self.assertLogs('django', level='WARNING') as logs:
+            result = _call_turn(bot, _gateway_patches(stream=stream), channel_name='c1')
+        self.assertEqual(result[0], 'Step 1: fold the')
+        self.assertEqual(stream.call_count, 1)
+        self.assertTrue(any('truncated' in line for line in logs.output))
+
+
+class EmptyRespondToUserTests(SimpleTestCase):
+    """T07 keeps this: respond_to_user with no text is a real failure and gets one retry."""
+
+    def test_empty_respond_to_user_retries_once(self):
+        def reply(text):
+            return {'choices': [{
+                'message': {'content': text, 'tool_calls': [{
+                    'id': 'tc_1', 'type': 'function',
+                    'function': {'name': 'respond_to_user', 'arguments': '{"quick_reply_chips": []}'},
+                }]},
+                'finish_reason': 'tool_calls',
+            }]}
+
+        gateway = mock.Mock(side_effect=[reply(''), reply('Hello, how can I help?')])
+        bot = SimpleNamespace(enable_web_search=False, stream=False, other_params={})
+        result = _call_turn(bot, _gateway_patches(gateway=gateway))
+        self.assertEqual(result[0], 'Hello, how can I help?')
+        self.assertEqual(gateway.call_count, 2)
