@@ -370,6 +370,7 @@ class BaseResponseHandler(ABC):
         )
         use_web_search = False if has_kb_tool else getattr(company_bot, 'enable_web_search', False)
         empty_respond_to_user_retried = False
+        text_streamed = False  # any text of this turn already sent to the client
 
         for iteration in range(max_iterations):
             if use_stream:
@@ -401,12 +402,21 @@ class BaseResponseHandler(ABC):
 
             response_data, extra, finish = result
 
+            if isinstance(extra, dict) and extra.get('_text_streamed_to_ws'):
+                text_streamed = True
+
             if finish in REFUSAL_FINISH_REASONS:
                 # No retry of any kind: the same request would be refused again (T31).
                 # TODO(T04): tag this call as a refusal once T04's call metadata is merged.
                 logger.warning(f'[tool_loop] model refusal (finish_reason={finish}) session={session_id} — sending error message')
+                if use_stream and text_streamed:
+                    # Tokens already sent can't be taken back: close that bubble so the error
+                    # message shows as its own message, not glued to the earlier text.
+                    self._send_chunk(channel_name, '', finish_reason='stop')
                 err_msg, is_vernacular = self.get_error_message(company_bot, language)
-                return err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None
+                return self._with_turn_usage(
+                    err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None, turn_usage,
+                )
 
             # Thinking blocks must go back unchanged on the assistant turn that carries the tool call.
             thinking_blocks = extra.pop('_thinking_blocks', None) if isinstance(extra, dict) else None
@@ -723,11 +733,7 @@ class BaseResponseHandler(ABC):
 
             if finish_reason in REFUSAL_FINISH_REASONS:
                 # Nothing is saved; the tool loop sends the error message instead (T31).
-                # Tokens already sent can't be taken back: close that bubble so the error
-                # message shows as its own message, not glued to the refused text.
-                if accumulated_content:
-                    self._send_chunk(channel_name, '', finish_reason='stop')
-                return '', None, finish_reason
+                return '', {'_text_streamed_to_ws': True} if accumulated_content else None, finish_reason
             thinking_blocks = (finish_chunk or {}).get('thinking_blocks')
 
             if tool_calls_buffer:

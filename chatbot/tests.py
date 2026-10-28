@@ -366,6 +366,41 @@ class RefusalTests(SimpleTestCase):
                 self.assertEqual(gateway.call_count, 1)
                 self.assertTrue(any('refusal' in line for line in logs.output))
 
+    def test_refusal_keeps_turn_usage(self):
+        gateway = mock.Mock(side_effect=[
+            {**_kb_call(), 'usage': {'input_tokens': 100, 'output_tokens': 5, 'total_tokens': 105}},
+            {'choices': [{'message': {'content': ''}, 'finish_reason': 'content_filter'}],
+             'usage': {'input_tokens': 150, 'output_tokens': 12, 'total_tokens': 162}},
+        ])
+        bot = SimpleNamespace(enable_web_search=True, stream=False, other_params={})
+        with mock.patch.object(BaseResponseHandler, '_update_session_usage'):
+            result = _kb_turn(bot, gateway=gateway)
+        self.assertEqual(result[0], 'Maaf kijiye.')
+        self.assertTrue(result[1]['_is_vernacular_error'])
+        self.assertEqual(result[1]['_usage_cost']['input_tokens'], 250)
+
+    def test_stream_refusal_after_kb_preamble_closes_the_bubble(self):
+        refusal = iter([('', None, 'content_filter', None, {'finish_reason': 'content_filter'})])
+        preamble_kb = iter([('Let me check the material. ', None, None, None, None)] + list(_kb_stream(THINKING)))
+        stream = mock.Mock(side_effect=[preamble_kb, refusal])
+        bot = SimpleNamespace(enable_web_search=False, stream=True, other_params=dict(HAIKU_55_SETTINGS))
+        patches = _gateway_patches(stream=stream) + [
+            mock.patch('chatbot.services.vector.vector_service.fetch_context_for_query', return_value=('', [CHUNK])),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            result = _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=[KB_TOOL], channel_name='c1',
+            )
+            sent = [c.kwargs.get('finish_reason') for c in BaseResponseHandler._send_chunk.call_args_list]
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        self.assertEqual(result[0], 'Maaf kijiye.')
+        self.assertEqual(sent[-1], 'stop')
+
     def test_stream_refusal_is_not_retried_or_saved(self):
         stream = mock.Mock(return_value=iter([
             ('I', None, None, None, None),
