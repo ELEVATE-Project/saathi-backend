@@ -382,10 +382,43 @@ class RefusalTests(SimpleTestCase):
                     system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
                     company_bot=bot, session_id='s1', profile_id=None, tools=[KB_TOOL], channel_name='c1',
                 )
+                sent = [c.kwargs.get('finish_reason') for c in BaseResponseHandler._send_chunk.call_args_list]
             finally:
                 for p in reversed(patches):
                     p.stop()
         self.assertEqual(result, ('Maaf kijiye.', {'_is_vernacular_error': True}, None))
         self.assertEqual(stream.call_count, 1)
         save.assert_not_called()
+        # The refused text already shown is closed as its own bubble, so the error message isn't glued to it.
+        self.assertEqual(sent[-1], 'stop')
         self.assertTrue(any('refusal' in line for line in logs.output))
+
+
+class ThinkingNotSentToClientTests(SimpleTestCase):
+    """T31 review: thinking blocks never reach the WebSocket client."""
+
+    def test_streamed_reply_stop_chunk_has_no_thinking_blocks(self):
+        stream = mock.Mock(return_value=iter([
+            ('Hello, how can I help?', None, None, None, None),
+            ('', {'index': 0, 'id': 'tc_1', 'name': 'respond_to_user',
+                  'arguments_delta': '{"quick_reply_chips": ["Yes"]}'}, None, None, None),
+            ('', None, 'tool_calls', None, {'finish_reason': 'tool_calls', 'thinking_blocks': THINKING}),
+        ]))
+        bot = SimpleNamespace(enable_web_search=False, stream=True, other_params=dict(HAIKU_55_SETTINGS))
+        patches = _gateway_patches(stream=stream)
+        for p in patches:
+            p.start()
+        try:
+            result = _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=None, channel_name='c1',
+            )
+            sent_extras = [c.kwargs.get('extra_content') or {} for c in BaseResponseHandler._send_chunk.call_args_list]
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        self.assertEqual(result[0], 'Hello, how can I help?')
+        self.assertEqual(sent_extras[-1].get('quick_reply_chips'), ['Yes'])
+        for extra in sent_extras:
+            self.assertNotIn('_thinking_blocks', extra)
+        self.assertNotIn('_thinking_blocks', result[1] or {})

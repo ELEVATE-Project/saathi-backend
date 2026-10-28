@@ -723,6 +723,10 @@ class BaseResponseHandler(ABC):
 
             if finish_reason in REFUSAL_FINISH_REASONS:
                 # Nothing is saved; the tool loop sends the error message instead (T31).
+                # Tokens already sent can't be taken back: close that bubble so the error
+                # message shows as its own message, not glued to the refused text.
+                if accumulated_content:
+                    self._send_chunk(channel_name, '', finish_reason='stop')
                 return '', None, finish_reason
             thinking_blocks = (finish_chunk or {}).get('thinking_blocks')
 
@@ -759,8 +763,6 @@ class BaseResponseHandler(ABC):
                         extra_content['quick_reply_chips'] = quick_reply_chips
                     # Marker consumed by _handle_gateway_response to skip web-search retry
                     extra_content['_respond_to_user_handled'] = True
-                    if thinking_blocks:
-                        extra_content['_thinking_blocks'] = thinking_blocks
 
                     if content:
                         # Text was streamed token-by-token; save to DB and send stop chunk with chips
@@ -775,7 +777,10 @@ class BaseResponseHandler(ABC):
                                                         if k != '_respond_to_user_handled'} or None)
                         return content, extra_content, 'stop'
                     else:
-                        # LLM generated no text — signal _handle_gateway_response to retry with correction
+                        # LLM generated no text — signal _handle_gateway_response to retry with correction.
+                        # Thinking blocks are added only here, after nothing was sent to the client.
+                        if thinking_blocks:
+                            extra_content['_thinking_blocks'] = thinking_blocks
                         return content, extra_content, None
 
                 # Any other tool call — preamble was already sent to WS token-by-token; only save to DB
