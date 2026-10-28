@@ -505,16 +505,6 @@ class BaseResponseHandler(ABC):
                 },
             ]
 
-            if tool_name == 'search_knowledge_base' and use_web_search and not new_chunks:
-                # Not shown to the user — just nudges the gateway/LLM to actually invoke web_search
-                # instead of answering from internal knowledge, whenever our fallback logic enables it.
-                current_messages = current_messages + [
-                    {
-                        'role': 'assistant',
-                        'content': "I couldn't find this in our knowledge base. Let me search the web for this.",
-                    },
-                ]
-
             # Remove executed tool so the LLM cannot call it again
             current_tools = [
                 t for t in (current_tools or [])
@@ -546,21 +536,21 @@ class BaseResponseHandler(ABC):
                     chunks_content += (
                         '\n\n---\n\n'
                         'These repository results passed the retrieval threshold, but check they actually '
-                        'answer the query before using them. If they do not, call the web_search tool now '
-                        'instead of answering from them or saying no result was found.'
+                        'answer the query before using them. If they do not, web search is available as a '
+                        'fallback.'
                     )
                 chunks_text = self._wrap_retrieved_content(chunks_content, source='repository')
             else:
                 if getattr(company_bot, 'enable_web_search', False):
                     no_result_message = (
-                        'No repository result found for this query. Web search is enabled for this bot — '
-                        'call the web_search tool now to answer this query before responding. '
-                        'Do not answer from general/internal knowledge first without doing web search.'
+                        'No repository result found for this query. Use web search to answer it. If web '
+                        'search finds nothing useful either, answer from general knowledge and tell the user '
+                        "the answer is not from Saathi's material or the web."
                     )
                 else:
                     no_result_message = (
-                        '(no repository result found — respond from general knowledge if appropriate, '
-                        'per no-hallucination rules)'
+                        'No repository result found for this query. If you answer from general knowledge, '
+                        "tell the user the answer is not from Saathi's material."
                     )
                 chunks_text = self._wrap_retrieved_content(no_result_message, source='none')
             logger.info(f'[tool_loop] search_knowledge_base: {len(retrieved_chunks)} chunks for query: {query}')
