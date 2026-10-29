@@ -543,3 +543,111 @@ class LogHygieneTests(SimpleTestCase):
         logged = self._receive('not json ' + self.TOKEN)
         self.assertNotIn(self.TOKEN, logged)
         self.assertIn(str(len('not json ' + self.TOKEN)), logged)
+
+
+ALLOWED_METADATA_KEYS = {'session_id', 'bot_id', 'bot_history_id', 'turn_id', 'call_kind', 'language'}
+
+
+def _respond(text, request_id=None):
+    reply = {'choices': [{
+        'message': {'content': text, 'tool_calls': [{
+            'id': 'tc_1', 'type': 'function',
+            'function': {'name': 'respond_to_user', 'arguments': '{"quick_reply_chips": []}'},
+        }]},
+        'finish_reason': 'tool_calls',
+    }]}
+    if request_id:
+        reply['id'] = request_id
+    return reply
+
+
+class CallMetadataTests(SimpleTestCase):
+    """T04: every LLM call carries ids (never text) so its gateway ledger row joins to the chat."""
+
+    def turn(self, gateway=None, stream=None, tools=None, other_params=None):
+        bot = SimpleNamespace(id=7, enable_web_search=False, stream=stream is not None,
+                              other_params=other_params or {})
+        patches = _gateway_patches(gateway=gateway, stream=stream) + [
+            mock.patch.object(_Handler, '_execute_tool', return_value=('Fold a strip.', [])),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'A fractions activity?'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=tools,
+                channel_name='c1' if stream is not None else None, language='hi',
+            )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def sent(self, call_mock):
+        return [c.kwargs['metadata'] for c in call_mock.call_args_list]
+
+    def test_answer_call_sends_ids_only(self):
+        gateway = mock.Mock(return_value=_respond('Here is an activity.', 'req-a'))
+        result = self.turn(gateway=gateway)
+        [metadata] = self.sent(gateway)
+        self.assertLessEqual(set(metadata), ALLOWED_METADATA_KEYS)
+        self.assertEqual(metadata['call_kind'], 'answer')
+        self.assertEqual(metadata['session_id'], 's1')
+        self.assertEqual(metadata['bot_id'], 7)
+        self.assertEqual(metadata['language'], 'hi')
+        self.assertTrue(metadata['turn_id'])
+        self.assertNotIn('fractions', json.dumps(metadata))
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-a'])
+
+    def test_call_after_tool_result_is_tool(self):
+        gateway = mock.Mock(side_effect=[dict(KB_CALL, id='req-a'), dict(FINAL_ANSWER, id='req-b')])
+        result = self.turn(gateway=gateway, tools=[KB_TOOL])
+        kinds = [m['call_kind'] for m in self.sent(gateway)]
+        self.assertEqual(kinds, ['answer', 'tool'])
+        self.assertEqual(len({m['turn_id'] for m in self.sent(gateway)}), 1)
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-a', 'req-b'])
+
+    def test_empty_respond_to_user_retry_is_retry(self):
+        gateway = mock.Mock(side_effect=[_respond(''), _respond('Hello, how can I help?')])
+        self.turn(gateway=gateway)
+        self.assertEqual([m['call_kind'] for m in self.sent(gateway)], ['answer', 'retry'])
+
+    def test_stream_merges_admin_metadata_under_ours(self):
+        stream = mock.Mock(return_value=iter([
+            ('Hello.', None, None, None, None),
+            ('', None, 'stop', None, {'finish_reason': 'stop', 'id': 'req-s'}),
+        ]))
+        result = self.turn(stream=stream, other_params={'metadata': {'team': 'saathi', 'call_kind': 'admin'}})
+        [metadata] = self.sent(stream)
+        self.assertEqual(metadata['team'], 'saathi')
+        self.assertEqual(metadata['call_kind'], 'answer')
+        self.assertEqual(metadata['session_id'], 's1')
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-s'])
+
+    def test_title_call_is_title(self):
+        from chatbot.celery_tasks import title_tasks
+
+        bot = SimpleNamespace(id=9, tool_context=None, context='Make a title.')
+        session = SimpleNamespace(title=None, company_bot=bot)
+        gateway = mock.Mock(return_value=None)
+        with mock.patch.object(title_tasks.ChatSession, 'objects') as sessions, \
+                mock.patch.object(title_tasks.Flow, 'objects') as flows, \
+                mock.patch.object(title_tasks.CompanyChat, 'objects'), \
+                mock.patch.object(title_tasks, 'get_guided_chat', return_value=[]), \
+                mock.patch.object(title_tasks, 'get_effective_provider_model', return_value=('anthropic', 'm')), \
+                mock.patch.object(title_tasks, 'build_gateway_params', return_value={}), \
+                mock.patch.object(title_tasks, 'call_llm_gateway', gateway):
+            sessions.filter.return_value.first.return_value = session
+            flows.filter.return_value.first.return_value = SimpleNamespace(title_bot=bot)
+            title_tasks.generate_session_title('s1')
+        metadata = gateway.call_args.kwargs['metadata']
+        self.assertEqual(metadata['call_kind'], 'title')
+        self.assertEqual(metadata['session_id'], 's1')
+        self.assertEqual(metadata['bot_id'], 9)
+
+    def test_request_ids_are_saved_on_the_chat_row(self):
+        chat = SimpleNamespace(id=3, other_params={'usage': {'input_tokens': 1}}, save=mock.Mock())
+        with mock.patch('chatbot.models.CompanyChat.objects') as chats:
+            chats.filter.return_value.order_by.return_value.first.return_value = chat
+            _Handler()._update_last_chat_usage('s1', {'input_tokens': 5}, request_ids=['req-a', 'req-b'])
+        self.assertEqual(chat.other_params['llm_request_ids'], ['req-a', 'req-b'])
+        self.assertEqual(chat.other_params['usage'], {'input_tokens': 5})

@@ -2,7 +2,9 @@ from celery import shared_task
 from django.db import transaction
 from chatbot.models import ChatSession, CompanyChat, Voice, VoiceType
 from chatbot.models.company_models import Flow
-from chatbot.llm_models.llm_gateway import call_llm_gateway, build_gateway_params, get_effective_provider_model
+from chatbot.llm_models.llm_gateway import (
+    build_call_metadata, build_gateway_params, call_llm_gateway, get_effective_provider_model,
+)
 from chatbot.utils.chat_utils import get_guided_chat
 from chatbot.utils.audio_provider_utils import text_translate_provider
 import json_repair
@@ -92,6 +94,7 @@ def generate_session_title(session_id, language='en'):
         params=build_gateway_params(company_bot),
         tools=tools or None,
         tool_choice=tool_choice,
+        metadata=build_call_metadata(session_id, company_bot, 'title', language=language),
     )
 
     if not response:
