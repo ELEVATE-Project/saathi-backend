@@ -672,3 +672,105 @@ class CallMetadataTests(SimpleTestCase):
             _Handler()._update_last_chat_usage('s1', {'input_tokens': 5}, request_ids=['req-a', 'req-b'])
         self.assertEqual(chat.other_params['llm_request_ids'], ['req-a', 'req-b'])
         self.assertEqual(chat.other_params['usage'], {'input_tokens': 5})
+
+
+class PromptVersionTests(SimpleTestCase):
+    """T05: each saved bot turn and each LLM call carry the bot's prompt version (its newest history_id)."""
+
+    def bot_with_history(self, history_id=412, stream=False):
+        history = mock.Mock()
+        history.order_by.return_value.values_list.return_value.first.return_value = history_id
+        return SimpleNamespace(id=7, enable_web_search=False, stream=stream, other_params={}, history=history)
+
+    def test_history_id_is_the_newest_history_row(self):
+        bot = self.bot_with_history(412)
+        self.assertEqual(_Handler()._bot_history_id(bot), 412)
+        bot.history.order_by.assert_called_once_with('-history_id')
+
+    def test_bot_without_history_gives_none(self):
+        self.assertIsNone(_Handler()._bot_history_id(SimpleNamespace(id=7)))
+        self.assertIsNone(_Handler()._bot_history_id(None))
+
+    def test_turn_reads_history_id_once_into_kwargs(self):
+        bot = self.bot_with_history(412)
+        handler = _Handler()
+        with mock.patch(f'{HANDLER_MODULE}.ChatSession.objects'), \
+                mock.patch.object(handler, 'check_early_return', return_value='early') as early:
+            handler.handle_response(session_id='s1', company_bot=bot)
+        self.assertEqual(early.call_args.kwargs['bot_history_id'], 412)
+        bot.history.order_by.assert_called_once()
+
+    def test_llm_response_passes_history_id_to_the_gateway_turn(self):
+        handler = _Handler()
+        with mock.patch(f'{HANDLER_MODULE}.ChatSession.objects'), \
+                mock.patch(f'{HANDLER_MODULE}.CompanyStateMachine.objects'), \
+                mock.patch.object(handler, '_handle_gateway_response', return_value=('Hi', None, 'stop')) as turn:
+            handler.get_llm_response(
+                system_prompt='You are Saathi.', messages=[], company_bot=SimpleNamespace(
+                    bot_type=CompanyBotTypeChoices.SIMPLE, tool_context=None),
+                session_id='s1', profile_id=None, channel_name=None, bot_history_id=412,
+            )
+        self.assertEqual(turn.call_args.kwargs['bot_history_id'], 412)
+
+    def run_turn(self, gateway=None, stream=None):
+        bot = self.bot_with_history(stream=stream is not None)
+        patches = _gateway_patches(gateway=gateway, stream=stream)
+        for p in patches:
+            p.start()
+        try:
+            from chatbot.services.response_handlers import base_response_handler as bh
+            _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=None,
+                channel_name='c1' if stream is not None else None, bot_history_id=412,
+            )
+            return bh.save_in_company_db
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_non_stream_call_metadata_has_history_id(self):
+        gateway = mock.Mock(return_value=FINAL_ANSWER)
+        self.run_turn(gateway=gateway)
+        self.assertEqual(gateway.call_args.kwargs['metadata']['bot_history_id'], 412)
+
+    def test_stream_saves_and_sends_history_id(self):
+        stream = mock.Mock(return_value=iter([
+            ('Hello.', None, None, None, None),
+            ('', None, 'stop', None, {'finish_reason': 'stop', 'id': 'req-s'}),
+        ]))
+        save = self.run_turn(stream=stream)
+        self.assertEqual(stream.call_args.kwargs['metadata']['bot_history_id'], 412)
+        self.assertEqual(save.call_args.kwargs['bot_history_id'], 412)
+
+    def test_regular_reply_is_saved_with_history_id(self):
+        handler = CommonResponseHandler()
+        bot = SimpleNamespace(bot_type=CompanyBotTypeChoices.SIMPLE)
+        with mock.patch('chatbot.services.response_handlers.common_handler.CompanyStateMachine.objects'), \
+                mock.patch.object(handler, 'translate_message', return_value='Hi'), \
+                mock.patch(f'{HANDLER_MODULE}.save_in_company_db') as save:
+            handler._handle_regular_response(
+                response='Hi', chat_session=SimpleNamespace(current_step=1), company_bot=bot,
+                session_id='s1', channel_name='c1', language='en', profile_id=None, chunks=[],
+                current_step=1, bot_history_id=412,
+            )
+        self.assertEqual(save.call_args.kwargs['bot_history_id'], 412)
+
+    def test_save_in_company_db_writes_history_id(self):
+        from chatbot.celery_tasks import common_chat_tasks
+
+        for given, stored in ((412, 412), (None, None)):
+            with self.subTest(given=given), \
+                    mock.patch.object(common_chat_tasks, 'Profile'), \
+                    mock.patch.object(common_chat_tasks.CompanyChat, 'objects') as chats:
+                kwargs = {'bot_history_id': given} if given is not None else {}
+                common_chat_tasks.save_in_company_db(
+                    session_id='s1', profile_id=None, initiated_by='AI', message='Hi', chunks=None,
+                    status=None, **kwargs,
+                )
+            self.assertEqual(chats.create.call_args.kwargs['bot_history_id'], stored)
+
+    def test_chat_column_is_nullable(self):
+        from chatbot.models import CompanyChat
+
+        self.assertTrue(CompanyChat._meta.get_field('bot_history_id').null)

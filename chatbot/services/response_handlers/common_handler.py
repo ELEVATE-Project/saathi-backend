@@ -76,7 +76,8 @@ class CommonResponseHandler(BaseResponseHandler):
 
             self.save_message(
                 session_id=session_id, profile_id=profile_id, message=bot_question, chunks=None,
-                status=ChatStatus.IN_PROGRESS, translated_message=translated_message, stage=stage
+                status=ChatStatus.IN_PROGRESS, translated_message=translated_message, stage=stage,
+                bot_history_id=kwargs.get('bot_history_id'),
             )
 
             return bot_question
@@ -135,7 +136,8 @@ class CommonResponseHandler(BaseResponseHandler):
                 'message_type': 'question',
                 'operation_type': 'non_llm',
                 'source': 'database'
-            }
+            },
+            bot_history_id=kwargs.get('bot_history_id'),
         )
         
         logger.info(f"Sent NON_LLM bot question from DB for state: {state_machine.name}")
@@ -615,7 +617,7 @@ class CommonResponseHandler(BaseResponseHandler):
         self.save_message(
             session_id=session_id, profile_id=profile_id, message=bot_question, chunks=chunks,
             status=chat_status, translated_message=translated_message, stage=stage,
-            other_params=other_params
+            other_params=other_params, bot_history_id=kwargs.get('bot_history_id'),
         )
 
         return response
@@ -675,7 +677,7 @@ class CommonResponseHandler(BaseResponseHandler):
         self.save_message(
             session_id=session_id, profile_id=profile_id, message=message_to_save, chunks=chunks,
             status=ChatStatus.IN_PROGRESS, translated_message=translated_message, stage=stage,
-            other_params=other_params if other_params else None
+            other_params=other_params if other_params else None, bot_history_id=kwargs.get('bot_history_id'),
         )
 
         return response
@@ -1048,6 +1050,7 @@ class CommonResponseHandler(BaseResponseHandler):
                 translated_message=translated_message,
                 stage=None,
                 other_params={'extra_content': extra_content_to_send} if extra_content_to_send else None,
+                bot_history_id=kwargs.get('bot_history_id'),
             )
 
             return bot_message

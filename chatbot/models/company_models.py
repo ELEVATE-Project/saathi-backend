@@ -359,6 +359,8 @@ class CompanyChat(models.Model):
     other_params = models.JSONField(null=True, blank=True)
     audio_file = models.FileField(upload_to=get_file_upload_path, max_length=1000, null=True, blank=True)
     file_url = models.TextField(null=True, blank=True)
+    # Prompt version (CompanyBot history_id) that produced this bot turn; NULL for user, REST and import rows (T05).
+    bot_history_id = models.IntegerField(null=True, blank=True)
 
     def __str__(self):
         return self.message
