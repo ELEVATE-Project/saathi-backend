@@ -18,6 +18,19 @@ from chatbot.utils.transliterate_utils import transliterate_text
 import jwt
 
 logger = logging.getLogger('django')
+
+SECRET_FRAME_KEYS = {'access_token', 'token', 'password'}
+
+
+def _mask_secrets(value):
+    """Copy of a websocket frame with secret values replaced, for logging (T35)."""
+    if isinstance(value, dict):
+        return {k: '***' if k in SECRET_FRAME_KEYS else _mask_secrets(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_mask_secrets(v) for v in value]
+    return value
+
+
 PUBLIC_KEY = os.getenv("JWT_PUBLIC_KEY")
 
 
@@ -56,8 +69,13 @@ class AsyncSocketConsumer(AsyncBaseConsumer):
     async def receive(self, text_data):
         self.last_activity = asyncio.get_running_loop().time()
         try:
-            logger.info(f"Received text data via common websocket: {text_data}")
-            text_data_json = json.loads(text_data)
+            try:
+                text_data_json = json.loads(text_data)
+            except ValueError:
+                logger.info('Received non-JSON text data via common websocket: %s chars', len(text_data))
+                raise
+            logger.info('Received text data via common websocket: %s',
+                        json.dumps(_mask_secrets(text_data_json), ensure_ascii=False))
             message_type = text_data_json.get('type', None)
             company_chat_status = None
             if message_type == 'authenticate':

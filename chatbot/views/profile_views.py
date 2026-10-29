@@ -86,7 +86,6 @@ def read_elevate_profile(request):
 def create_profile_views(request):
     body = request.data
     access_token = body.get('access_token')
-    print("Access token: ", access_token)
 
     if not access_token:
         return Response({

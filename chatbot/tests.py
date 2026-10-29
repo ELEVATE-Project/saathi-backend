@@ -1,3 +1,8 @@
+import asyncio
+import io
+import json
+import os
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
@@ -457,3 +462,84 @@ class ThinkingNotSentToClientTests(SimpleTestCase):
         for extra in sent_extras:
             self.assertNotIn('_thinking_blocks', extra)
         self.assertNotIn('_thinking_blocks', result[1] or {})
+
+
+class LogHygieneTests(SimpleTestCase):
+    """T35: secrets never reach the logs or stdout; other details stay (PD-53)."""
+
+    TOKEN = 'eyJ-test-access-token-T35'
+
+    def test_login_does_not_print_password(self):
+        from rest_framework.test import APIRequestFactory
+        from chatbot.views import api_views
+
+        request = APIRequestFactory().post(
+            '/login', {'email': 'teacher@example.com', 'password': 'hunter2-T35'}, format='json')
+        out = io.StringIO()
+        with mock.patch.object(api_views.Profile.objects, 'filter', return_value=[]), redirect_stdout(out):
+            api_views.login(request)
+        self.assertNotIn('hunter2-T35', out.getvalue())
+        self.assertIn('teacher@example.com', out.getvalue())
+
+    def test_create_profile_does_not_print_access_token(self):
+        from rest_framework.test import APIRequestFactory
+        from chatbot.views import profile_views
+
+        request = APIRequestFactory().post('/profile', {'access_token': self.TOKEN}, format='json')
+        out = io.StringIO()
+        with mock.patch.object(profile_views, 'create_profile_utils', return_value={'success': True, 'data': {}}), \
+                redirect_stdout(out):
+            profile_views.create_profile_views(request)
+        self.assertNotIn(self.TOKEN, out.getvalue())
+
+    def test_openai_stt_does_not_print_api_key(self):
+        from chatbot.translate.openai import openai_stt
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {'OPENAI_API_KEY': 'sk-test-key-T35'}), \
+                mock.patch.object(openai_stt, 'OpenAI', side_effect=RuntimeError('stop')), \
+                self.assertLogs('django', 'ERROR') as logs, redirect_stdout(out):
+            openai_stt.transcribe_audio('', 'wav', 'en', SimpleNamespace(other_params={}))
+        self.assertNotIn('sk-test-key-T35', out.getvalue() + '\n'.join(logs.output))
+
+    def test_bedrock_client_does_not_print_aws_key(self):
+        from chatbot.llm_models import llm_script
+
+        client = mock.Mock()
+        client.converse.side_effect = RuntimeError('stop')
+        out = io.StringIO()
+        with mock.patch.object(llm_script.boto3, 'client', return_value=client), redirect_stdout(out):
+            try:
+                llm_script.handle_bedrock_model.__wrapped__(
+                    {}, messages=None, aws_key='AKIATESTKEYT35', aws_secret_key='secret-T35')
+            except Exception:
+                pass
+        self.assertNotIn('AKIATESTKEYT35', out.getvalue())
+        self.assertNotIn('secret-T35', out.getvalue())
+
+    def _receive(self, frame):
+        from chatbot.consumers import async_consumer
+
+        consumer = async_consumer.AsyncSocketConsumer()
+        consumer.handle_access_token = mock.AsyncMock(return_value='u1')
+        consumer.upsert_elevate_profile = mock.AsyncMock(return_value={'error': 'unauthorized'})
+        consumer.send = mock.AsyncMock()
+        consumer.close = mock.AsyncMock()
+        with mock.patch.object(async_consumer, 'fetch_elevate_user', return_value={}), \
+                self.assertLogs('django', 'INFO') as logs:
+            asyncio.run(consumer.receive(frame))
+        return '\n'.join(logs.output)
+
+    def test_authenticate_frame_log_hides_access_token_only(self):
+        logged = self._receive(json.dumps({
+            'type': 'authenticate', 'sessionid': 'sess-T35', 'route': '/saathi-bot-eval',
+            'access_token': self.TOKEN,
+        }))
+        self.assertNotIn(self.TOKEN, logged)
+        self.assertIn('sess-T35', logged)
+        self.assertIn('/saathi-bot-eval', logged)
+
+    def test_non_json_frame_is_logged_by_size(self):
+        logged = self._receive('not json ' + self.TOKEN)
+        self.assertNotIn(self.TOKEN, logged)
+        self.assertIn(str(len('not json ' + self.TOKEN)), logged)
