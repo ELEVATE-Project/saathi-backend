@@ -73,6 +73,8 @@ class BaseResponseHandler(ABC):
         chat_session = ChatSession.objects.get(session=session_id)
         chunks = []
         is_function_call = False
+        # Prompt version when the turn starts; saved on its bot rows and sent on its LLM calls (T05).
+        kwargs['bot_history_id'] = self._bot_history_id(kwargs.get('company_bot'))
         early_return = self.check_early_return(chat_session, **kwargs)
         if early_return is not None:
             if isinstance(early_return, str):
@@ -330,7 +332,7 @@ class BaseResponseHandler(ABC):
         result = self._handle_gateway_response(
             system_prompt=system_prompt, messages=message_to_send, company_bot=company_bot,
             session_id=session_id, profile_id=profile_id, tools=tools, channel_name=channel_name,
-            language=kwargs.get('language'),
+            language=kwargs.get('language'), bot_history_id=kwargs.get('bot_history_id'),
         )
 
         if result is None or (isinstance(result, tuple) and result[0] is None):
@@ -345,7 +347,7 @@ class BaseResponseHandler(ABC):
 
     def _handle_gateway_response(
         self, system_prompt, messages, company_bot, session_id, profile_id, tools=None, channel_name=None,
-        language=None,
+        language=None, bot_history_id=None,
     ):
         import json as _json
 
@@ -390,7 +392,10 @@ class BaseResponseHandler(ABC):
         admin_metadata = metadata_param if isinstance(metadata_param, dict) else {}
 
         for iteration in range(max_iterations):
-            call_metadata = build_call_metadata(session_id, company_bot, call_kind, turn_id=turn_id, language=language)
+            call_metadata = build_call_metadata(
+                session_id, company_bot, call_kind, turn_id=turn_id, language=language,
+                bot_history_id=bot_history_id,
+            )
             if use_stream:
                 result = self._handle_gateway_stream(
                     gateway_messages=current_messages, company_bot=company_bot,
@@ -399,6 +404,7 @@ class BaseResponseHandler(ABC):
                     cache_policy=cache_policy, metadata={**admin_metadata, **call_metadata},
                     retrieved_chunks=retrieved_chunks, append_to_last=append_to_last,
                     use_web_search=use_web_search, turn_usage=turn_usage, request_ids=request_ids,
+                    bot_history_id=bot_history_id,
                 )
             else:
                 result = self._call_gateway_non_stream(
@@ -719,7 +725,7 @@ class BaseResponseHandler(ABC):
     def _handle_gateway_stream(
         self, gateway_messages, company_bot, session_id, profile_id, tools, tool_choice,
         channel_name, cache_policy=None, metadata=None, retrieved_chunks=None, append_to_last=False,
-        use_web_search=False, turn_usage=None, request_ids=None,
+        use_web_search=False, turn_usage=None, request_ids=None, bot_history_id=None,
     ):
         import json
         accumulated_content = []
@@ -812,6 +818,7 @@ class BaseResponseHandler(ABC):
                             message=content, chunks=all_chunks, status=ChatStatus.IN_PROGRESS,
                             stage=None, append_to_last=append_to_last,
                             other_params={'usage': usage_cost} if usage_cost else None,
+                            bot_history_id=bot_history_id,
                         )
                         self._send_chunk(channel_name, '', finish_reason='stop',
                                          extra_content={k: v for k, v in extra_content.items()
@@ -831,6 +838,7 @@ class BaseResponseHandler(ABC):
                     save_in_company_db(
                         session_id=session_id, profile_id=profile_id, initiated_by='AI',
                         message=preamble, chunks=None, status=ChatStatus.IN_PROGRESS, stage=None,
+                        bot_history_id=bot_history_id,
                     )
                 all_chunks_for_tool = list(retrieved_chunks or []) + citation_chunks
                 extra_for_tool = {}
@@ -856,6 +864,7 @@ class BaseResponseHandler(ABC):
                     message=content, chunks=all_chunks, status=ChatStatus.IN_PROGRESS, stage=None,
                     append_to_last=append_to_last,
                     other_params={'usage': usage_cost} if usage_cost else None,
+                    bot_history_id=bot_history_id,
                 )
             sources = self._prepare_sources(all_chunks)
             extra_content = {'sources': sources} if sources else None
@@ -1006,6 +1015,17 @@ class BaseResponseHandler(ABC):
         for k in ('input_tokens', 'output_tokens', 'total_tokens', 'cache_read_tokens', 'cache_write_tokens'):
             accumulator[k] = accumulator.get(k, 0) + (usage_cost.get(k) or 0)
         accumulator['cost_usd'] = round(accumulator.get('cost_usd', 0) + (usage_cost.get('cost_usd') or 0), 6)
+
+    def _bot_history_id(self, company_bot):
+        """Newest CompanyBot history_id (the prompt version), or None (T05). One query."""
+        history = getattr(company_bot, 'history', None)
+        if history is None:
+            return None
+        try:
+            return history.order_by('-history_id').values_list('history_id', flat=True).first()
+        except Exception as e:
+            logger.error(f'[_bot_history_id] failed: {e}')
+            return None
 
     def _last_ai_chat_id(self, session_id):
         """Id of the newest AI CompanyChat in this session, or None."""
@@ -1235,7 +1255,7 @@ class BaseResponseHandler(ABC):
         return False
 
     def save_message(self, session_id, profile_id, message, chunks,
-                     status, translated_message, stage=None, other_params=None):
+                     status, translated_message, stage=None, other_params=None, bot_history_id=None):
         """Save message to database"""
         save_in_company_db(
             session_id=session_id,
@@ -1246,7 +1266,8 @@ class BaseResponseHandler(ABC):
             status=status,
             translated_message=translated_message,
             stage=stage,
-            other_params=other_params
+            other_params=other_params,
+            bot_history_id=bot_history_id,
         )
 
     def translate_message(self, message, channel_name, step_number, language, company_bot, extra_content=None,

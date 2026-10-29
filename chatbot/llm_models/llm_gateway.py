@@ -201,7 +201,9 @@ def get_cache_options() -> dict | None:
     return None
 
 
-def build_call_metadata(session_id, company_bot, call_kind, turn_id=None, language=None) -> dict:
+def build_call_metadata(
+    session_id, company_bot, call_kind, turn_id=None, language=None, bot_history_id=None,
+) -> dict:
     """Ids sent as the gateway request `metadata`, saved on its ledger row (T04).
 
     Ids only, never message text. The gateway's `metadata` field is optional and it
@@ -210,7 +212,7 @@ def build_call_metadata(session_id, company_bot, call_kind, turn_id=None, langua
     return {
         'session_id': str(session_id) if session_id is not None else None,
         'bot_id': getattr(company_bot, 'id', None),
-        'bot_history_id': None,  # filled by T05 (prompt version)
+        'bot_history_id': bot_history_id,  # prompt version (T05)
         'turn_id': turn_id,
         'call_kind': call_kind,  # answer | tool | retry | title
         'language': language,
