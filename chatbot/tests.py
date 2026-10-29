@@ -611,6 +611,13 @@ class CallMetadataTests(SimpleTestCase):
         self.turn(gateway=gateway)
         self.assertEqual([m['call_kind'] for m in self.sent(gateway)], ['answer', 'retry'])
 
+    def test_empty_retry_failure_keeps_request_ids(self):
+        gateway = mock.Mock(side_effect=[_respond('', 'req-a'), _respond('', 'req-b')])
+        with mock.patch.object(_Handler, 'get_error_message', return_value=('Sorry.', False)):
+            result = self.turn(gateway=gateway)
+        self.assertEqual(result[0], 'Sorry.')
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-a', 'req-b'])
+
     def test_stream_merges_admin_metadata_under_ours(self):
         stream = mock.Mock(return_value=iter([
             ('Hello.', None, None, None, None),

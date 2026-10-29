@@ -461,7 +461,10 @@ class BaseResponseHandler(ABC):
                     if not response_data:
                         logger.info('[tool_loop] respond_to_user still empty after retry — sending default error')
                         err_msg, is_vernacular = self.get_error_message(company_bot, language)
-                        return err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None
+                        return self._with_turn_usage(
+                            err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None,
+                            turn_usage, request_ids,
+                        )
                     return self._with_turn_usage(response_data, extra, finish, turn_usage, request_ids)
                 # Web search held back for KB fallback. Only retry if LLM gave NO response at all —
                 # a non-empty answer is a deliberate choice (and streaming already sent those tokens).
@@ -534,7 +537,10 @@ class BaseResponseHandler(ABC):
 
         logger.error('[tool_loop] max tool iterations reached')
         err_msg, is_vernacular = self.get_error_message(company_bot, language)
-        return err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, 'stop'
+        return self._with_turn_usage(
+            err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, 'stop',
+            turn_usage, request_ids,
+        )
 
     def _execute_tool(self, tool_name, arguments, company_bot):
         """Execute a tool call and return (result_text_for_llm, retrieved_chunks)."""
