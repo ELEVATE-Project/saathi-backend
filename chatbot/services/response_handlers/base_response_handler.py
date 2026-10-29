@@ -136,7 +136,10 @@ class BaseResponseHandler(ABC):
 
         response = None
         streaming_completed = False
+        turn_start_chat_id = None
         if not is_function_call and not kwargs.get('skip_llm', False):
+            # Newest AI message before this turn: request ids go only to a message saved by this turn (T04).
+            turn_start_chat_id = self._last_ai_chat_id(session_id)
             result = self.get_llm_response(**kwargs)
 
             if isinstance(result, tuple):
@@ -245,7 +248,9 @@ class BaseResponseHandler(ABC):
         _usage_cost = kwargs.get('_usage_cost')
         _llm_request_ids = kwargs.get('_llm_request_ids')
         if _usage_cost or _llm_request_ids:
-            self._update_last_chat_usage(session_id, _usage_cost, request_ids=_llm_request_ids)
+            self._update_last_chat_usage(
+                session_id, _usage_cost, request_ids=_llm_request_ids, after_chat_id=turn_start_chat_id,
+            )
         return process_result
 
     def analyze_response_for_postprocessing(self, response):
@@ -330,7 +335,9 @@ class BaseResponseHandler(ABC):
 
         if result is None or (isinstance(result, tuple) and result[0] is None):
             logger.error("LLM gateway response returned None")
-            return None, None, None
+            extra = result[1] if isinstance(result, tuple) and isinstance(result[1], dict) else {}
+            request_ids = extra.get('_llm_request_ids')
+            return None, ({'_llm_request_ids': request_ids} if request_ids else None), None
 
         response, extra_content, finish_reason = result
         return response, extra_content, finish_reason
@@ -410,7 +417,8 @@ class BaseResponseHandler(ABC):
             print("="*50)
 
             if not result or (isinstance(result, tuple) and result[0] is None):
-                return None, None, None
+                # Keep the ids of the calls already made this turn, so the fallback reply links to them (T04).
+                return None, ({'_llm_request_ids': list(request_ids)} if request_ids else None), None
 
             response_data, extra, finish = result
 
@@ -999,8 +1007,22 @@ class BaseResponseHandler(ABC):
             accumulator[k] = accumulator.get(k, 0) + (usage_cost.get(k) or 0)
         accumulator['cost_usd'] = round(accumulator.get('cost_usd', 0) + (usage_cost.get('cost_usd') or 0), 6)
 
-    def _update_last_chat_usage(self, session_id, usage_cost, request_ids=None):
-        """Merge usage cost and the turn's gateway request ids into the most recently saved AI CompanyChat."""
+    def _last_ai_chat_id(self, session_id):
+        """Id of the newest AI CompanyChat in this session, or None."""
+        from chatbot.models import CompanyChat
+        try:
+            return CompanyChat.objects.filter(
+                session=session_id, sender__id=1
+            ).order_by('-id').values_list('id', flat=True).first()
+        except Exception as e:
+            logger.error(f'[_last_ai_chat_id] failed: {e}')
+            return None
+
+    def _update_last_chat_usage(self, session_id, usage_cost, request_ids=None, after_chat_id=None):
+        """Merge usage cost and the turn's gateway request ids into the most recently saved AI CompanyChat.
+
+        Request ids are saved only if that message is newer than after_chat_id (saved by this turn).
+        """
         from chatbot.models import CompanyChat
         try:
             chat = CompanyChat.objects.filter(
@@ -1010,7 +1032,7 @@ class BaseResponseHandler(ABC):
                 other_params = chat.other_params or {}
                 if usage_cost:
                     other_params['usage'] = usage_cost
-                if request_ids:
+                if request_ids and (after_chat_id is None or chat.id > after_chat_id):
                     # Joins this chat row to its gateway ledger rows (T04).
                     other_params['llm_request_ids'] = list(request_ids)
                 chat.other_params = other_params

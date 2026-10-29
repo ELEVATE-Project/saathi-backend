@@ -618,6 +618,20 @@ class CallMetadataTests(SimpleTestCase):
         self.assertEqual(result[0], 'Sorry.')
         self.assertEqual(result[1]['_llm_request_ids'], ['req-a', 'req-b'])
 
+    def test_failed_follow_up_call_keeps_request_ids(self):
+        gateway = mock.Mock(side_effect=[dict(KB_CALL, id='req-a'), None])
+        result = self.turn(gateway=gateway, tools=[KB_TOOL])
+        self.assertIsNone(result[0])
+        self.assertEqual(result[1], {'_llm_request_ids': ['req-a']})
+
+    def test_request_ids_skip_a_message_from_an_earlier_turn(self):
+        chat = SimpleNamespace(id=3, other_params={}, save=mock.Mock())
+        with mock.patch('chatbot.models.CompanyChat.objects') as chats:
+            chats.filter.return_value.order_by.return_value.first.return_value = chat
+            _Handler()._update_last_chat_usage('s1', {'input_tokens': 5}, request_ids=['req-a'], after_chat_id=3)
+        self.assertNotIn('llm_request_ids', chat.other_params)
+        self.assertEqual(chat.other_params['usage'], {'input_tokens': 5})
+
     def test_stream_merges_admin_metadata_under_ours(self):
         stream = mock.Mock(return_value=iter([
             ('Hello.', None, None, None, None),
