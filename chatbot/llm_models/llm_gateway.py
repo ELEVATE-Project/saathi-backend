@@ -201,9 +201,25 @@ def get_cache_options() -> dict | None:
     return None
 
 
+def build_call_metadata(session_id, company_bot, call_kind, turn_id=None, language=None) -> dict:
+    """Ids sent as the gateway request `metadata`, saved on its ledger row (T04).
+
+    Ids only, never message text. The gateway's `metadata` field is optional and it
+    keeps only allow-listed keys, so callers that send none still work.
+    """
+    return {
+        'session_id': str(session_id) if session_id is not None else None,
+        'bot_id': getattr(company_bot, 'id', None),
+        'bot_history_id': None,  # filled by T05 (prompt version)
+        'turn_id': turn_id,
+        'call_kind': call_kind,  # answer | tool | retry | title
+        'language': language,
+    }
+
+
 def call_llm_gateway(
     messages: list, provider: str, model: str, params: dict = None, tools: list = None,
-    tool_choice=None,
+    tool_choice=None, metadata: dict = None,
 ) -> dict | None:
     """
     POST to /v1/chat/ on the LLM gateway service.
@@ -233,6 +249,9 @@ def call_llm_gateway(
 
     if tool_choice is not None:
         payload['tool_choice'] = tool_choice
+
+    if metadata is not None:
+        payload['metadata'] = metadata
 
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=120)
