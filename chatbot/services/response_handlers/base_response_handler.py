@@ -375,7 +375,8 @@ class BaseResponseHandler(ABC):
         retrieved_chunks = []
         append_to_last = False
         max_iterations = 5
-        turn_usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'cost_usd': 0.0, 'web_searches': 0}
+        turn_usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'cost_usd': 0.0, 'web_searches': 0,
+                      'web_searches_unsure': 0}
 
         # If the KB tool is present, web search is held back until KB returns nothing (fallback).
         # If there is no KB tool, respect enable_web_search from the bot config immediately.
@@ -1029,7 +1030,9 @@ class BaseResponseHandler(ABC):
             self._drop_legacy_web_plugin(params)
         if not use_web_search:
             return tools, 0
-        left = web_search_budget(company_bot) - (turn_usage or {}).get('web_searches', 0)
+        used = turn_usage or {}
+        # A call whose search count we could not read may have used any number of them: none are left.
+        left = 0 if used.get('web_searches_unsure') else web_search_budget(company_bot) - used.get('web_searches', 0)
         tool = build_web_search_tool(company_bot, provider, left)
         if tool is None:
             return tools, 0
@@ -1059,8 +1062,10 @@ class BaseResponseHandler(ABC):
 
         Best source: the gateway's usage.web_search_requests (the provider's own count). Without
         it: Anthropic replies hold one web_search_tool_result per search, so count those. Any
-        other citation shape doesn't give the count, so it spends the whole budget. A search that
-        returns no citations and no count is not seen (checked live, see T28 Handoff).
+        other citation shape doesn't give the count. In both of those cases, and when there is
+        no count and no citations (a search can return none), the call is marked unsure and
+        `_with_web_search_tool` offers no more searches this turn: a retry or a second tool call
+        must never get a fresh allowance. `web_searches` stays the count we know, for the log.
         """
         if turn_usage is None or not searches_allowed:
             return
@@ -1072,18 +1077,19 @@ class BaseResponseHandler(ABC):
         if not tool_results:
             tool_results = [r for r in (web_search_results or []) if isinstance(r, dict)]
         if tool_results:
-            made = len(tool_results)
-        elif citations:
-            made = searches_allowed
-        else:
+            turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + min(len(tool_results), searches_allowed)
             return
-        turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + min(made, searches_allowed)
+        if citations:
+            turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + 1
+        turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
 
     def _with_turn_usage(self, response_data, extra, finish, turn_usage, request_ids=None):
         """Return a (response, extra, finish) tuple with turn_usage and the gateway request ids injected into extra."""
-        web_searches = turn_usage.get('web_searches', 0)
-        logger.info(f'[tool_loop] web_searches={web_searches}')
-        turn_usage = {k: v for k, v in turn_usage.items() if k != 'web_searches'}
+        logger.info(
+            f"[tool_loop] web_searches={turn_usage.get('web_searches', 0)} "
+            f"unsure_calls={turn_usage.get('web_searches_unsure', 0)}"
+        )
+        turn_usage = {k: v for k, v in turn_usage.items() if k not in ('web_searches', 'web_searches_unsure')}
         if any(turn_usage.values()):
             extra = dict(extra) if isinstance(extra, dict) else {}
             extra['_usage_cost'] = dict(turn_usage)
