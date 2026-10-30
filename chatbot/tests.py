@@ -235,6 +235,17 @@ class WebSearchToolTests(SimpleTestCase):
         uses = [[t['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
         self.assertEqual(uses, [[], [2], [2]])
 
+    def test_unknown_count_and_no_citations_spends_the_budget(self):
+        # No count, no citations: we cannot tell whether it searched, so a retry gets no fresh allowance.
+        for provider, key in (('openrouter', 'parameters'), ('anthropic', None)):
+            with self.subTest(provider=provider):
+                gateway = self.run_turn([KB_CALL, KB_CALL, FINAL_ANSWER], provider=provider, tools=[KB_TOOL])
+                counts = [
+                    [(t[key] if key else t)['max_uses'] for t in self.web_tools(c)]
+                    for c in gateway.call_args_list
+                ]
+                self.assertEqual(counts, [[], [2], []])
+
     def test_stream_counts_searches_from_the_finish_payload(self):
         finish = {'finish_reason': 'stop', 'citations': [ANTHROPIC_SEARCH], 'usage': {}}
         stream = mock.Mock(return_value=iter([('Hi', None, None, None, None), ('', None, 'stop', None, finish)]))
