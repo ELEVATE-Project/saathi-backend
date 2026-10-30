@@ -250,9 +250,10 @@ class WebSearchToolTests(SimpleTestCase):
         finish = {'finish_reason': 'stop', 'citations': [ANTHROPIC_SEARCH], 'usage': {}}
         stream = mock.Mock(return_value=iter([('Hi', None, None, None, None), ('', None, 'stop', None, finish)]))
         bot = SimpleNamespace(enable_web_search=True, stream=True, other_params={})
-        with self.assertLogs('django', level='INFO') as logs:
+        out = io.StringIO()
+        with redirect_stdout(out):
             _call_turn(bot, _gateway_patches(stream=stream), channel_name='c1')
-        self.assertTrue(any('web_searches=1' in line for line in logs.output))
+        self.assertIn('web_searches=1 unsure_calls=0', out.getvalue())
 
     def test_openrouter_legacy_web_plugin_is_dropped_but_other_plugins_stay(self):
         bot_options = {'plugins': [{'id': 'web', 'max_results': 5}, {'id': 'file-parser'}], 'models': ['m']}
@@ -284,9 +285,11 @@ class WebSearchToolTests(SimpleTestCase):
         self.assertEqual([t['name'] for t in tools], ['web_search'])
 
     def test_searches_are_logged_per_turn(self):
-        with self.assertLogs('django', level='INFO') as logs:
+        out = io.StringIO()
+        with redirect_stdout(out):
             self.run_turn([KB_CALL, _kb_call_with_web([ANTHROPIC_SEARCH]), FINAL_ANSWER], tools=[KB_TOOL])
-        self.assertTrue(any('web_searches=1' in line for line in logs.output))
+        # The last call reports no count here, so it is unsure; the known count stays 1.
+        self.assertIn('web_searches=1 unsure_calls=1', out.getvalue())
 
 
 class WebSearchParamsTests(SimpleTestCase):

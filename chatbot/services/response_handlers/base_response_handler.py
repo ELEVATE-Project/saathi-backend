@@ -1085,7 +1085,8 @@ class BaseResponseHandler(ABC):
 
     def _with_turn_usage(self, response_data, extra, finish, turn_usage, request_ids=None):
         """Return a (response, extra, finish) tuple with turn_usage and the gateway request ids injected into extra."""
-        logger.info(
+        # print, like the other [tool_loop] lines: logger.info is below the worker's log level.
+        print(
             f"[tool_loop] web_searches={turn_usage.get('web_searches', 0)} "
             f"unsure_calls={turn_usage.get('web_searches_unsure', 0)}"
         )
