@@ -636,7 +636,7 @@ class BaseResponseHandler(ABC):
             finish_reason = choice.get('finish_reason')
             self._log_if_truncated(finish_reason, session_id)
             self._count_web_searches(
-                turn_usage, searches_allowed, message.get('citations'),
+                turn_usage, searches_allowed, data.get('usage'), message.get('citations'),
                 (message.get('provider_specific_fields') or {}).get('web_search_results'),
             )
             if finish_reason in REFUSAL_FINISH_REASONS:
@@ -770,7 +770,11 @@ class BaseResponseHandler(ABC):
                 if chunk_finish_data:
                     finish_chunk = chunk_finish_data
             self._log_if_truncated(finish_reason, session_id)
-            self._count_web_searches(turn_usage, searches_allowed, citation_events, None)
+            finish_data = finish_chunk or {}
+            self._count_web_searches(
+                turn_usage, searches_allowed, finish_data.get('usage'),
+                citation_events or finish_data.get('citations'), None,
+            )
             if request_ids is not None and (finish_chunk or {}).get('id'):
                 request_ids.append(finish_chunk['id'])
 
@@ -1021,6 +1025,8 @@ class BaseResponseHandler(ABC):
                 params.pop('web_search_options', None)
             return tools, 0
         params.pop('web_search_options', None)
+        if provider == 'openrouter':
+            self._drop_legacy_web_plugin(params)
         if not use_web_search:
             return tools, 0
         left = web_search_budget(company_bot) - (turn_usage or {}).get('web_searches', 0)
@@ -1029,14 +1035,38 @@ class BaseResponseHandler(ABC):
             return tools, 0
         return list(tools or []) + [tool], left
 
-    def _count_web_searches(self, turn_usage, searches_allowed, citations, web_search_results):
+    def _drop_legacy_web_plugin(self, params):
+        """T28: OpenRouter's deprecated `web` plugin would search on top of the tool, past the limit.
+
+        Copies provider_options (it is the bot's own dict) and keeps every other plugin.
+        """
+        options = params.get('provider_options')
+        plugins = options.get('plugins') if isinstance(options, dict) else None
+        if not plugins:
+            return
+        kept = [p for p in plugins if not (isinstance(p, dict) and p.get('id') == 'web')]
+        if len(kept) == len(plugins):
+            return
+        options = dict(options)
+        if kept:
+            options['plugins'] = kept
+        else:
+            options.pop('plugins')
+        params['provider_options'] = options
+
+    def _count_web_searches(self, turn_usage, searches_allowed, usage, citations, web_search_results):
         """T28: add this call's searches to the turn count (never more than it was allowed).
 
-        Anthropic replies hold one web_search_tool_result per search: count them. Any other
-        citation shape (OpenRouter) doesn't tell us the count, so it spends the whole budget.
-        The real count, usage.server_tool_use.web_search_requests, is not passed on yet (T21).
+        Best source: the gateway's usage.web_search_requests (the provider's own count). Without
+        it: Anthropic replies hold one web_search_tool_result per search, so count those. Any
+        other citation shape doesn't give the count, so it spends the whole budget. A search that
+        returns no citations and no count is not seen (checked live, see T28 Handoff).
         """
         if turn_usage is None or not searches_allowed:
+            return
+        reported = (usage or {}).get('web_search_requests')
+        if reported is not None:
+            turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + min(int(reported), searches_allowed)
             return
         tool_results = [c for c in (citations or []) if isinstance(c, dict) and 'content' in c]
         if not tool_results:

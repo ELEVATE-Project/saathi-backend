@@ -220,6 +220,45 @@ class WebSearchToolTests(SimpleTestCase):
         uses = [[t['parameters']['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
         self.assertEqual(uses, [[], [2], []])
 
+    def test_reported_search_count_beats_citations(self):
+        # The gateway's own count: 2 searches, no citations in the reply -> nothing left for call 3.
+        call = json.loads(json.dumps(KB_CALL))
+        call['usage'] = {'web_search_requests': 2}
+        gateway = self.run_turn([KB_CALL, call, FINAL_ANSWER], provider='openrouter', tools=[KB_TOOL])
+        uses = [[t['parameters']['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
+        self.assertEqual(uses, [[], [2], []])
+
+    def test_reported_zero_searches_keeps_the_budget(self):
+        call = _kb_call_with_web([ANTHROPIC_SEARCH])
+        call['usage'] = {'web_search_requests': 0}
+        gateway = self.run_turn([KB_CALL, call, FINAL_ANSWER], tools=[KB_TOOL])
+        uses = [[t['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
+        self.assertEqual(uses, [[], [2], [2]])
+
+    def test_stream_counts_searches_from_the_finish_payload(self):
+        finish = {'finish_reason': 'stop', 'citations': [ANTHROPIC_SEARCH], 'usage': {}}
+        stream = mock.Mock(return_value=iter([('Hi', None, None, None, None), ('', None, 'stop', None, finish)]))
+        bot = SimpleNamespace(enable_web_search=True, stream=True, other_params={})
+        with self.assertLogs('django', level='INFO') as logs:
+            _call_turn(bot, _gateway_patches(stream=stream), channel_name='c1')
+        self.assertTrue(any('web_searches=1' in line for line in logs.output))
+
+    def test_openrouter_legacy_web_plugin_is_dropped_but_other_plugins_stay(self):
+        bot_options = {'plugins': [{'id': 'web', 'max_results': 5}, {'id': 'file-parser'}], 'models': ['m']}
+        params = {'provider_options': bot_options}
+        with mock.patch(f'{HANDLER_MODULE}.get_effective_provider_model', return_value=('openrouter', 'm')):
+            tools, _ = _Handler()._with_web_search_tool(
+                SimpleNamespace(other_params={}), params, [], True, {'web_searches': 0})
+        self.assertEqual(params['provider_options'], {'plugins': [{'id': 'file-parser'}], 'models': ['m']})
+        self.assertEqual(len(bot_options['plugins']), 2)  # the bot's own dict is not changed
+        self.assertEqual(tools[0]['type'], 'openrouter:web_search')
+
+    def test_openrouter_only_web_plugin_leaves_no_plugins_key(self):
+        params = {'provider_options': {'plugins': [{'id': 'web'}]}}
+        with mock.patch(f'{HANDLER_MODULE}.get_effective_provider_model', return_value=('openrouter', 'm')):
+            _Handler()._with_web_search_tool(SimpleNamespace(other_params={}), params, [], False, {})
+        self.assertEqual(params['provider_options'], {})
+
     def test_other_providers_keep_web_search_options(self):
         gateway = self.run_turn([FINAL_ANSWER], provider='openai')
         call = gateway.call_args_list[0]
