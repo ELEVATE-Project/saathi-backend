@@ -6,8 +6,9 @@ from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, override_settings
 
+from chatbot.llm_models.llm_gateway import build_gateway_params
 from chatbot.models import CompanyBotTypeChoices
 from chatbot.services.response_handlers.base_response_handler import BaseResponseHandler
 from chatbot.services.response_handlers.common_handler import CommonResponseHandler
@@ -78,12 +79,12 @@ class WebSearchFallbackTests(SimpleTestCase):
     def test_kb_empty_does_not_end_with_assistant_message(self):
         second, _ = self.run_turn(chunks=[])
         self.assertNotEqual(second['messages'][-1]['role'], 'assistant')
-        self.assertIn('web_search_options', second['params'])
+        self.assertIn('web_search', [t.get('name') for t in second['tools']])
 
     def test_kb_hit_keeps_web_search_as_fallback(self):
         second, _ = self.run_turn(chunks=[CHUNK])
         self.assertNotEqual(second['messages'][-1]['role'], 'assistant')
-        self.assertIn('web_search_options', second['params'])
+        self.assertIn('web_search', [t.get('name') for t in second['tools']])
 
     def test_kb_hit_note_offers_web_only_as_fallback(self):
         _, tool_result = self.run_turn(chunks=[CHUNK])
@@ -100,7 +101,163 @@ class WebSearchFallbackTests(SimpleTestCase):
     def test_kb_empty_web_off_says_answer_is_not_from_saathi_material(self):
         second, tool_result = self.run_turn(chunks=[], enable_web_search=False)
         self.assertNotIn('web_search_options', second['params'])
+        self.assertNotIn('web_search', [t.get('name') for t in second['tools'] or []])
         self.assertIn("not from Saathi's material", tool_result)
+
+
+ANTHROPIC_SEARCH = {'content': [{'type': 'web_search_result', 'url': 'https://a.example', 'title': 'A'}]}
+
+
+def _kb_call_with_web(citations):
+    """A KB tool call whose reply also carries web citations (the model searched in this call)."""
+    call = json.loads(json.dumps(KB_CALL))
+    call['choices'][0]['message']['citations'] = citations
+    return call
+
+
+class WebSearchToolTests(SimpleTestCase):
+    """T28: web search is a raw tool the backend builds per provider, with a per-turn budget."""
+
+    def run_turn(self, responses, provider='anthropic', other_params=None, enable_web_search=True,
+                 tools=None):
+        bot = SimpleNamespace(
+            enable_web_search=enable_web_search, stream=False, other_params=other_params or {},
+        )
+        gateway = mock.Mock(side_effect=responses)
+        with mock.patch(f'{HANDLER_MODULE}.call_llm_gateway', gateway), \
+                mock.patch(f'{HANDLER_MODULE}.build_gateway_params',
+                           side_effect=lambda _bot: {'web_search_options': {'search_context_size': 'low'}}), \
+                mock.patch(f'{HANDLER_MODULE}.get_effective_provider_model', return_value=(provider, 'm')), \
+                mock.patch('chatbot.services.vector.vector_service.fetch_context_for_query',
+                           return_value=('', [CHUNK])):
+            _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=tools,
+            )
+        return gateway
+
+    @staticmethod
+    def web_tools(call):
+        return [t for t in (call.kwargs['tools'] or []) if t.get('type') != 'function']
+
+    def test_anthropic_gets_raw_tool_with_default_limit_and_india(self):
+        gateway = self.run_turn([FINAL_ANSWER])
+        call = gateway.call_args_list[0]
+        self.assertEqual(self.web_tools(call), [{
+            'type': 'web_search_20250305', 'name': 'web_search', 'max_uses': 2,
+            'user_location': {'type': 'approximate', 'country': 'IN', 'timezone': 'Asia/Kolkata'},
+        }])
+        self.assertNotIn('web_search_options', call.kwargs['params'])
+
+    def test_web_off_sends_no_tool(self):
+        for provider in ('anthropic', 'openrouter', 'openai'):
+            with self.subTest(provider=provider):
+                gateway = self.run_turn([FINAL_ANSWER], provider=provider, enable_web_search=False)
+                call = gateway.call_args_list[0]
+                self.assertEqual(self.web_tools(call), [])
+                self.assertNotIn('web_search_options', call.kwargs['params'])
+
+    def test_kb_turn_holds_web_back_then_offers_it(self):
+        gateway = self.run_turn([KB_CALL, FINAL_ANSWER], tools=[KB_TOOL])
+        self.assertEqual(self.web_tools(gateway.call_args_list[0]), [])
+        self.assertEqual(len(self.web_tools(gateway.call_args_list[1])), 1)
+
+    def test_budget_is_per_turn_not_per_call(self):
+        # call 1: KB, no web. call 2: web allowed (2) and 1 search made. call 3: 1 left. Then 0 left.
+        gateway = self.run_turn(
+            [KB_CALL, _kb_call_with_web([ANTHROPIC_SEARCH]), _kb_call_with_web([ANTHROPIC_SEARCH]),
+             FINAL_ANSWER],
+            tools=[KB_TOOL],
+        )
+        uses = [[t['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
+        self.assertEqual(uses, [[], [2], [1], []])
+
+    def test_other_params_override_defaults(self):
+        override = {
+            'max_uses': 1, 'allowed_domains': ['ncert.nic.in'], 'excluded_domains': ['x.com'],
+            'user_location': {'type': 'approximate', 'country': 'NP'},
+        }
+        gateway = self.run_turn([FINAL_ANSWER], other_params={'web_search': override})
+        tool = self.web_tools(gateway.call_args_list[0])[0]
+        self.assertEqual(tool['max_uses'], 1)
+        self.assertEqual(tool['allowed_domains'], ['ncert.nic.in'])
+        self.assertEqual(tool['blocked_domains'], ['x.com'])  # Anthropic's name for excluded_domains
+        self.assertEqual(tool['user_location']['country'], 'NP')
+
+    @override_settings(WEB_SEARCH_MAX_USES_PER_TURN=3, WEB_SEARCH_COUNTRY='NP', WEB_SEARCH_TIMEZONE='Asia/Kathmandu')
+    def test_settings_change_the_defaults(self):
+        tool = self.web_tools(self.run_turn([FINAL_ANSWER]).call_args_list[0])[0]
+        self.assertEqual(tool['max_uses'], 3)
+        self.assertEqual(tool['user_location'], {
+            'type': 'approximate', 'country': 'NP', 'timezone': 'Asia/Kathmandu'})
+
+    def test_openrouter_gets_server_tool_and_no_plugin_param(self):
+        gateway = self.run_turn([FINAL_ANSWER], provider='openrouter')
+        call = gateway.call_args_list[0]
+        self.assertEqual(self.web_tools(call), [{
+            'type': 'openrouter:web_search',
+            'parameters': {
+                'engine': 'native', 'max_uses': 2,
+                'user_location': {'type': 'approximate', 'country': 'IN', 'timezone': 'Asia/Kolkata'},
+            },
+        }])
+        self.assertNotIn('web_search_options', call.kwargs['params'])
+
+    def test_openrouter_engine_and_domains_come_from_the_setting(self):
+        cfg = {'engine': 'exa', 'allowed_domains': ['ncert.nic.in'], 'excluded_domains': ['x.com']}
+        gateway = self.run_turn([FINAL_ANSWER], provider='openrouter', other_params={'web_search': cfg})
+        params = self.web_tools(gateway.call_args_list[0])[0]['parameters']
+        self.assertEqual(params['engine'], 'exa')
+        self.assertEqual(params['allowed_domains'], ['ncert.nic.in'])
+        self.assertEqual(params['excluded_domains'], ['x.com'])
+
+    def test_openrouter_any_citation_spends_the_whole_budget(self):
+        # OpenRouter's search count is not in the reply we read: a citation counts as all spent.
+        flat = [[{'url': 'https://a.example', 'title': 'A', 'cited_text': 't'}]]
+        gateway = self.run_turn(
+            [KB_CALL, _kb_call_with_web(flat), FINAL_ANSWER], provider='openrouter', tools=[KB_TOOL],
+        )
+        uses = [[t['parameters']['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
+        self.assertEqual(uses, [[], [2], []])
+
+    def test_other_providers_keep_web_search_options(self):
+        gateway = self.run_turn([FINAL_ANSWER], provider='openai')
+        call = gateway.call_args_list[0]
+        self.assertEqual(self.web_tools(call), [])
+        self.assertIn('web_search_options', call.kwargs['params'])
+
+    def test_stream_call_gets_the_tool_too(self):
+        stream = mock.Mock(return_value=iter([('Hi', None, None, None, None), (None, None, 'stop', None, None)]))
+        bot = SimpleNamespace(enable_web_search=True, stream=True, other_params={})
+        _call_turn(bot, _gateway_patches(stream=stream), channel_name='c1')
+        tools = stream.call_args.kwargs['tools']
+        self.assertEqual([t['name'] for t in tools], ['web_search'])
+
+    def test_searches_are_logged_per_turn(self):
+        with self.assertLogs('django', level='INFO') as logs:
+            self.run_turn([KB_CALL, _kb_call_with_web([ANTHROPIC_SEARCH]), FINAL_ANSWER], tools=[KB_TOOL])
+        self.assertTrue(any('web_searches=1' in line for line in logs.output))
+
+
+class WebSearchParamsTests(SimpleTestCase):
+    """T28: build_gateway_params sends web_search_options only to providers without a raw tool."""
+
+    @staticmethod
+    def bot(provider):
+        return SimpleNamespace(
+            max_token=None, bot_temperature=None, connect_timeout=None, read_timeout=None,
+            other_params={}, gateway_provider=provider, gateway_model='m', gateway_sub_provider=None,
+            enable_web_search=True, web_search_context_size='low', enable_cache=False,
+        )
+
+    def test_raw_tool_providers_get_no_web_search_options(self):
+        for provider in ('anthropic', 'openrouter'):
+            with self.subTest(provider=provider):
+                self.assertNotIn('web_search_options', build_gateway_params(self.bot(provider)))
+
+    def test_other_providers_keep_web_search_options(self):
+        self.assertEqual(
+            build_gateway_params(self.bot('openai'))['web_search_options'], {'search_context_size': 'low'})
 
 
 def _gateway_patches(gateway=None, stream=None):

@@ -483,3 +483,9 @@ LOG_VIEWER_PATTERNS = ["INFO", "DEBUG", "WARNING", "ERROR", "CRITICAL"]
 LOG_VIEWER_FILE_LIST_TITLE = "Application Logs"
 
 CRONJOBS = []
+
+# T28: web search sent as a raw tool. A bot's other_params.web_search overrides these.
+WEB_SEARCH_MAX_USES_PER_TURN = int(os.getenv('WEB_SEARCH_MAX_USES_PER_TURN', '2'))
+WEB_SEARCH_COUNTRY = os.getenv('WEB_SEARCH_COUNTRY', 'IN')
+WEB_SEARCH_TIMEZONE = os.getenv('WEB_SEARCH_TIMEZONE', 'Asia/Kolkata')
+WEB_SEARCH_ENGINE_OPENROUTER = os.getenv('WEB_SEARCH_ENGINE_OPENROUTER', 'native')

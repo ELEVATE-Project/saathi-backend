@@ -5,7 +5,8 @@ from django.db import transaction
 from chatbot.celery_tasks.common_chat_tasks import save_in_company_db
 from chatbot.celery_tasks.handle_message import translate_and_send_message
 from chatbot.llm_models.llm_gateway import (
-    build_call_metadata, build_gateway_params, call_llm_gateway, call_llm_gateway_stream, get_effective_provider_model,
+    RAW_WEB_SEARCH_PROVIDERS, build_call_metadata, build_gateway_params, build_web_search_tool, call_llm_gateway,
+    call_llm_gateway_stream, get_effective_provider_model, web_search_budget,
 )
 from chatbot.models import ChatSession, ChatStatus, CompanyBotTypeChoices
 from chatbot.models.bot_vernacular_model import BotVernacular
@@ -374,7 +375,7 @@ class BaseResponseHandler(ABC):
         retrieved_chunks = []
         append_to_last = False
         max_iterations = 5
-        turn_usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'cost_usd': 0.0}
+        turn_usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'cost_usd': 0.0, 'web_searches': 0}
 
         # If the KB tool is present, web search is held back until KB returns nothing (fallback).
         # If there is no KB tool, respect enable_web_search from the bot config immediately.
@@ -611,8 +612,7 @@ class BaseResponseHandler(ABC):
         import json
         try:
             params = build_gateway_params(company_bot)
-            if not use_web_search:
-                params.pop('web_search_options', None)
+            tools, searches_allowed = self._with_web_search_tool(company_bot, params, tools, use_web_search, turn_usage)
             print(f'[non_stream] use_web_search={use_web_search} bot.enable_web_search={getattr(company_bot, "enable_web_search", "N/A")} web_search_in_params={"web_search_options" in params}')
             effective_provider, effective_model = get_effective_provider_model(company_bot)
             data = call_llm_gateway(
@@ -635,6 +635,10 @@ class BaseResponseHandler(ABC):
             message = choice.get('message', {})
             finish_reason = choice.get('finish_reason')
             self._log_if_truncated(finish_reason, session_id)
+            self._count_web_searches(
+                turn_usage, searches_allowed, message.get('citations'),
+                (message.get('provider_specific_fields') or {}).get('web_search_results'),
+            )
             if finish_reason in REFUSAL_FINISH_REASONS:
                 return '', None, finish_reason
             tool_calls = message.get('tool_calls') or []
@@ -733,10 +737,12 @@ class BaseResponseHandler(ABC):
         finish_reason = None
         try:
             stream_params = build_gateway_params(company_bot)
-            if not use_web_search:
-                stream_params.pop('web_search_options', None)
+            tools, searches_allowed = self._with_web_search_tool(
+                company_bot, stream_params, tools, use_web_search, turn_usage,
+            )
             print(f'[stream] use_web_search={use_web_search} bot.enable_web_search={getattr(company_bot, "enable_web_search", "N/A")} web_search_in_params={"web_search_options" in stream_params}')
             citation_chunks = []
+            citation_events = []
             finish_chunk = None
             effective_provider, effective_model = get_effective_provider_model(company_bot)
             for delta_content, tool_use_delta, chunk_finish_reason, chunk_citations, chunk_finish_data in call_llm_gateway_stream(
@@ -757,12 +763,14 @@ class BaseResponseHandler(ABC):
                         tool_calls_buffer[idx]['name'] = tool_use_delta['name']
                     tool_calls_buffer[idx]['arguments'] += tool_use_delta.get('arguments_delta') or ''
                 if chunk_citations:
+                    citation_events.extend(chunk_citations)
                     citation_chunks.extend(self._extract_citation_chunks_from_stream(chunk_citations))
                 if chunk_finish_reason:
                     finish_reason = chunk_finish_reason
                 if chunk_finish_data:
                     finish_chunk = chunk_finish_data
             self._log_if_truncated(finish_reason, session_id)
+            self._count_web_searches(turn_usage, searches_allowed, citation_events, None)
             if request_ids is not None and (finish_chunk or {}).get('id'):
                 request_ids.append(finish_chunk['id'])
 
@@ -1000,8 +1008,52 @@ class BaseResponseHandler(ABC):
         except Exception:
             return fallback
 
+    def _with_web_search_tool(self, company_bot, params, tools, use_web_search, turn_usage):
+        """T28: add web search to one call. Returns (tools, searches this call may make).
+
+        anthropic and openrouter get a raw tool sized to what is left of the turn's budget
+        (a KB turn makes several calls and `max_uses` is per request). Other providers keep
+        the `web_search_options` param, only while web search is on.
+        """
+        provider = get_effective_provider_model(company_bot)[0]
+        if provider not in RAW_WEB_SEARCH_PROVIDERS:
+            if not use_web_search:
+                params.pop('web_search_options', None)
+            return tools, 0
+        params.pop('web_search_options', None)
+        if not use_web_search:
+            return tools, 0
+        left = web_search_budget(company_bot) - (turn_usage or {}).get('web_searches', 0)
+        tool = build_web_search_tool(company_bot, provider, left)
+        if tool is None:
+            return tools, 0
+        return list(tools or []) + [tool], left
+
+    def _count_web_searches(self, turn_usage, searches_allowed, citations, web_search_results):
+        """T28: add this call's searches to the turn count (never more than it was allowed).
+
+        Anthropic replies hold one web_search_tool_result per search: count them. Any other
+        citation shape (OpenRouter) doesn't tell us the count, so it spends the whole budget.
+        The real count, usage.server_tool_use.web_search_requests, is not passed on yet (T21).
+        """
+        if turn_usage is None or not searches_allowed:
+            return
+        tool_results = [c for c in (citations or []) if isinstance(c, dict) and 'content' in c]
+        if not tool_results:
+            tool_results = [r for r in (web_search_results or []) if isinstance(r, dict)]
+        if tool_results:
+            made = len(tool_results)
+        elif citations:
+            made = searches_allowed
+        else:
+            return
+        turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + min(made, searches_allowed)
+
     def _with_turn_usage(self, response_data, extra, finish, turn_usage, request_ids=None):
         """Return a (response, extra, finish) tuple with turn_usage and the gateway request ids injected into extra."""
+        web_searches = turn_usage.get('web_searches', 0)
+        logger.info(f'[tool_loop] web_searches={web_searches}')
+        turn_usage = {k: v for k, v in turn_usage.items() if k != 'web_searches'}
         if any(turn_usage.values()):
             extra = dict(extra) if isinstance(extra, dict) else {}
             extra['_usage_cost'] = dict(turn_usage)
