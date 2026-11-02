@@ -6,12 +6,31 @@ from chatbot.utils.shiksha_chaupal.date_utils import handle_date_prompt
 from chatbot.celery_tasks.common_chat_tasks import save_in_company_db
 from chatbot.celery_tasks.handle_message import translate_and_send_message
 from chatbot.utils.audio_provider_utils import text_translate_provider
+from functools import lru_cache
 import logging
 import json
 import os
 from json_repair import repair_json
 
 logger = logging.getLogger('django')
+
+
+def _translate_saved_text(message, language, voice_provider):
+    response = text_translate_provider(
+        voice_provider=voice_provider, message_body=message,
+        target_language=language, source_language='en',
+    )
+    content = response.get('content') if isinstance(response, dict) else None
+    if (not isinstance(response, dict) or response.get('status') != 200
+            or not isinstance(content, str) or not content.strip()):
+        raise ValueError('Saved message translation failed')
+    return content
+
+
+@lru_cache(maxsize=128)
+def _translate_handoff_placeholder(language, voice_provider):
+    """Cache successful fixed text only, per language and Voice configuration."""
+    return _translate_saved_text('Understood.', language, voice_provider)
 
 
 class CommonResponseHandler(BaseResponseHandler):
@@ -673,6 +692,19 @@ class CommonResponseHandler(BaseResponseHandler):
             message_to_save = extra_content["query"]
         else:
             message_to_save = "Understood."
+
+        if message_to_save != response and translated_message is None and language != 'en':
+            try:
+                voice_provider = Voice.objects.filter(
+                    company_bot=company_bot, type=VoiceType.TextToText, language=language,
+                ).first()
+                if voice_provider:
+                    if message_to_save == 'Understood.':
+                        translated_message = _translate_handoff_placeholder(language, voice_provider)
+                    else:
+                        translated_message = _translate_saved_text(message_to_save, language, voice_provider)
+            except Exception:
+                logger.warning('Saved hand-off translation failed; keeping original text')
 
         self.save_message(
             session_id=session_id, profile_id=profile_id, message=message_to_save, chunks=chunks,
