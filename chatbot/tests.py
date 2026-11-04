@@ -36,6 +36,10 @@ KB_CALL = {
     }],
 }
 
+# A KB call whose reply reports 0 web searches. A first call with no reported count is "unsure" (T28),
+# which would use up the turn's web budget, so tests that expect web search on call 2 use this one (T50).
+KB_CALL_0 = {**KB_CALL, 'usage': {'web_search_requests': 0}}
+
 FINAL_ANSWER = {
     'choices': [{'message': {'content': 'Here is an activity.'}, 'finish_reason': 'stop'}],
 }
@@ -59,7 +63,7 @@ class WebSearchFallbackTests(SimpleTestCase):
 
     def run_turn(self, chunks, enable_web_search=True):
         bot = SimpleNamespace(enable_web_search=enable_web_search, stream=False, other_params={})
-        gateway = mock.Mock(side_effect=[KB_CALL, FINAL_ANSWER])
+        gateway = mock.Mock(side_effect=[KB_CALL_0, FINAL_ANSWER])
         with mock.patch(f'{HANDLER_MODULE}.call_llm_gateway', gateway), \
                 mock.patch(f'{HANDLER_MODULE}.build_gateway_params',
                            side_effect=lambda _bot: {'web_search_options': {'search_context_size': 'low'}}), \
@@ -157,20 +161,21 @@ class WebSearchToolTests(SimpleTestCase):
                 self.assertEqual(self.web_tools(call), [])
                 self.assertNotIn('web_search_options', call.kwargs['params'])
 
-    def test_kb_turn_holds_web_back_then_offers_it(self):
-        gateway = self.run_turn([KB_CALL, FINAL_ANSWER], tools=[KB_TOOL])
-        self.assertEqual(self.web_tools(gateway.call_args_list[0]), [])
+    def test_kb_turn_offers_web_from_the_first_call(self):
+        # T50: the tool list does not change between calls, so the model plans with web search from call 1.
+        gateway = self.run_turn([KB_CALL_0, FINAL_ANSWER], tools=[KB_TOOL])
+        self.assertEqual(len(self.web_tools(gateway.call_args_list[0])), 1)
         self.assertEqual(len(self.web_tools(gateway.call_args_list[1])), 1)
 
     def test_budget_is_per_turn_not_per_call(self):
-        # call 1: KB, no web. call 2: web allowed (2) and 1 search made. call 3: 1 left. Then 0 left.
+        # T50: web is offered from call 1. call 1: KB, no search. call 2: 1 search made. call 3: 1 left. Then 0.
         gateway = self.run_turn(
-            [KB_CALL, _kb_call_with_web([ANTHROPIC_SEARCH]), _kb_call_with_web([ANTHROPIC_SEARCH]),
+            [KB_CALL_0, _kb_call_with_web([ANTHROPIC_SEARCH]), _kb_call_with_web([ANTHROPIC_SEARCH]),
              FINAL_ANSWER],
             tools=[KB_TOOL],
         )
         uses = [[t['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
-        self.assertEqual(uses, [[], [2], [1], []])
+        self.assertEqual(uses, [[2], [2], [1], []])
 
     def test_other_params_override_defaults(self):
         override = {
@@ -215,28 +220,30 @@ class WebSearchToolTests(SimpleTestCase):
         # OpenRouter's search count is not in the reply we read: a citation counts as all spent.
         flat = [[{'url': 'https://a.example', 'title': 'A', 'cited_text': 't'}]]
         gateway = self.run_turn(
-            [KB_CALL, _kb_call_with_web(flat), FINAL_ANSWER], provider='openrouter', tools=[KB_TOOL],
+            [KB_CALL_0, _kb_call_with_web(flat), FINAL_ANSWER], provider='openrouter', tools=[KB_TOOL],
         )
         uses = [[t['parameters']['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
-        self.assertEqual(uses, [[], [2], []])
+        self.assertEqual(uses, [[2], [2], []])
 
     def test_reported_search_count_beats_citations(self):
         # The gateway's own count: 2 searches, no citations in the reply -> nothing left for call 3.
         call = json.loads(json.dumps(KB_CALL))
         call['usage'] = {'web_search_requests': 2}
-        gateway = self.run_turn([KB_CALL, call, FINAL_ANSWER], provider='openrouter', tools=[KB_TOOL])
+        gateway = self.run_turn([KB_CALL_0, call, FINAL_ANSWER], provider='openrouter', tools=[KB_TOOL])
         uses = [[t['parameters']['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
-        self.assertEqual(uses, [[], [2], []])
+        self.assertEqual(uses, [[2], [2], []])
 
     def test_reported_zero_searches_keeps_the_budget(self):
         call = _kb_call_with_web([ANTHROPIC_SEARCH])
         call['usage'] = {'web_search_requests': 0}
-        gateway = self.run_turn([KB_CALL, call, FINAL_ANSWER], tools=[KB_TOOL])
+        gateway = self.run_turn([KB_CALL_0, call, FINAL_ANSWER], tools=[KB_TOOL])
         uses = [[t['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
-        self.assertEqual(uses, [[], [2], [2]])
+        self.assertEqual(uses, [[2], [2], [2]])
 
-    def test_unknown_count_and_no_citations_spends_the_budget(self):
-        # No count, no citations: we cannot tell whether it searched, so a retry gets no fresh allowance.
+    def test_no_count_and_no_citations_counts_no_search(self):
+        # T50: web_search is offered from the first call, and providers omit the count when no search ran
+        # (Anthropic sends server_tool_use only after a search; streamed OpenRouter loses it, T46). A call with
+        # no count, no citations and no search results is a call without a search, so the tool list stays fixed.
         for provider, key in (('openrouter', 'parameters'), ('anthropic', None)):
             with self.subTest(provider=provider):
                 gateway = self.run_turn([KB_CALL, KB_CALL, FINAL_ANSWER], provider=provider, tools=[KB_TOOL])
@@ -244,7 +251,7 @@ class WebSearchToolTests(SimpleTestCase):
                     [(t[key] if key else t)['max_uses'] for t in self.web_tools(c)]
                     for c in gateway.call_args_list
                 ]
-                self.assertEqual(counts, [[], [2], []])
+                self.assertEqual(counts, [[2], [2], [2]])
 
     def test_stream_counts_searches_from_the_finish_payload(self):
         finish = {'finish_reason': 'stop', 'citations': [ANTHROPIC_SEARCH], 'usage': {}}
@@ -287,9 +294,9 @@ class WebSearchToolTests(SimpleTestCase):
     def test_searches_are_logged_per_turn(self):
         out = io.StringIO()
         with redirect_stdout(out):
-            self.run_turn([KB_CALL, _kb_call_with_web([ANTHROPIC_SEARCH]), FINAL_ANSWER], tools=[KB_TOOL])
-        # The last call reports no count here, so it is unsure; the known count stays 1.
-        self.assertIn('web_searches=1 unsure_calls=1', out.getvalue())
+            self.run_turn([KB_CALL_0, _kb_call_with_web([ANTHROPIC_SEARCH]), FINAL_ANSWER], tools=[KB_TOOL])
+        # The last call reports no count and no citations, so it made no search (T50); the count stays 1.
+        self.assertIn('web_searches=1 unsure_calls=0', out.getvalue())
 
 
 class WebSearchParamsTests(SimpleTestCase):
@@ -984,3 +991,128 @@ class PromptVersionTests(SimpleTestCase):
         from chatbot.models import CompanyChat
 
         self.assertTrue(CompanyChat._meta.get_field('bot_history_id').null)
+
+
+def _tool_names(call):
+    """Tool names of one gateway call, in order (a raw web-search tool has its own `name`)."""
+    return [(t.get('function') or {}).get('name') or t.get('name') for t in (call.kwargs['tools'] or [])]
+
+
+def _call_of(name, call_id='tc_x', arguments='{}'):
+    return {
+        'choices': [{
+            'message': {'content': None, 'tool_calls': [{
+                'id': call_id, 'type': 'function', 'function': {'name': name, 'arguments': arguments},
+            }]},
+            'finish_reason': 'tool_calls',
+        }],
+    }
+
+
+class StableToolListTests(SimpleTestCase):
+    """T50: the tool list stays the same for every call of a turn; a call to a tool that was not offered never crashes."""
+
+    def setUp(self):
+        patcher = mock.patch.object(BaseResponseHandler, 'get_error_message', return_value=('Sorry.', False))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_turn(self, responses, enable_web_search=True, tools=(KB_TOOL,)):
+        bot = SimpleNamespace(enable_web_search=enable_web_search, stream=False, other_params={})
+        gateway = mock.Mock(side_effect=responses)
+        with mock.patch(f'{HANDLER_MODULE}.call_llm_gateway', gateway), \
+                mock.patch(f'{HANDLER_MODULE}.build_gateway_params', side_effect=lambda _bot: {}), \
+                mock.patch(f'{HANDLER_MODULE}.get_effective_provider_model', return_value=('anthropic', 'm')), \
+                mock.patch('chatbot.services.vector.vector_service.fetch_context_for_query',
+                           return_value=('', [CHUNK])) as kb:
+            result = _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=list(tools),
+            )
+        return result, gateway, kb
+
+    @staticmethod
+    def tool_results(call):
+        return [m['content'] for m in call.kwargs['messages'] if m['role'] == 'tool']
+
+    def test_first_call_has_web_search_with_a_kb_tool(self):
+        _, gateway, _ = self.run_turn([KB_CALL, FINAL_ANSWER])
+        self.assertEqual(_tool_names(gateway.call_args_list[0]), ['search_knowledge_base', 'web_search'])
+
+    def test_tool_list_is_identical_across_calls_and_keeps_kb(self):
+        _, gateway, _ = self.run_turn([KB_CALL_0, FINAL_ANSWER])
+        first, second = (_tool_names(c) for c in gateway.call_args_list)
+        self.assertEqual(first, second)
+        self.assertIn('search_knowledge_base', second)
+
+    def test_web_off_tool_list_is_just_the_bot_tools_on_every_call(self):
+        _, gateway, _ = self.run_turn([KB_CALL, FINAL_ANSWER], enable_web_search=False)
+        self.assertEqual([_tool_names(c) for c in gateway.call_args_list],
+                         [['search_knowledge_base'], ['search_knowledge_base']])
+
+    def test_repeated_kb_call_gets_already_searched_and_runs_no_second_search(self):
+        second_kb = _call_of('search_knowledge_base', 'tc_2', '{"query": "again"}')
+        result, gateway, kb = self.run_turn([KB_CALL, second_kb, FINAL_ANSWER])
+        self.assertEqual(result[0], 'Here is an activity.')
+        self.assertEqual(kb.call_count, 1)
+        results = self.tool_results(gateway.call_args_list[2])
+        self.assertEqual(len(results), 2)
+        self.assertIn('already searched', results[1])
+        self.assertIn('do not call search_knowledge_base again', results[1])
+
+    def test_repeating_kb_forever_still_ends(self):
+        result, gateway, kb = self.run_turn([_call_of('search_knowledge_base', f'tc_{i}') for i in range(10)])
+        self.assertEqual(result[0], 'Sorry.')
+        self.assertEqual(kb.call_count, 1)
+        self.assertLessEqual(gateway.call_count, 5)
+
+    def test_web_search_call_with_web_off_gets_an_error_result_and_a_normal_reply(self):
+        result, gateway, _ = self.run_turn([_call_of('web_search', 'tc_w'), FINAL_ANSWER], enable_web_search=False)
+        self.assertEqual(result[0], 'Here is an activity.')
+        self.assertEqual(gateway.call_count, 2)
+        results = self.tool_results(gateway.call_args_list[1])
+        self.assertEqual(len(results), 1)
+        self.assertIn('web_search is not available in this chat', results[0])
+        self.assertIn('do not say you searched online', results[0])
+        # The list the model sees did not change: still no web search, KB kept.
+        self.assertEqual(_tool_names(gateway.call_args_list[1]), ['search_knowledge_base'])
+
+    def test_unknown_tool_name_gets_an_error_result_and_a_normal_reply(self):
+        result, gateway, _ = self.run_turn([_call_of('do_magic', 'tc_m'), FINAL_ANSWER])
+        self.assertEqual(result[0], 'Here is an activity.')
+        self.assertIn('do_magic', self.tool_results(gateway.call_args_list[1])[0])
+        self.assertIn('not available', self.tool_results(gateway.call_args_list[1])[0])
+
+    def test_unoffered_call_is_answered_only_once_per_turn(self):
+        result, gateway, _ = self.run_turn(
+            [_call_of('web_search', 'tc_1'), _call_of('web_search', 'tc_2'), FINAL_ANSWER], enable_web_search=False)
+        self.assertEqual(result[0], 'Sorry.')
+        self.assertEqual(gateway.call_count, 2)
+
+    def test_stream_web_search_call_with_web_off_does_not_crash(self):
+        web_call = iter([('', {'index': 0, 'id': 'tc_w', 'name': 'web_search', 'arguments_delta': '{}'},
+                          None, None, None),
+                         ('', None, 'tool_calls', None, {'finish_reason': 'tool_calls'})])
+        answer = iter([('Here is an activity.', None, None, None, None),
+                       ('', None, 'stop', None, {'finish_reason': 'stop'})])
+        stream = mock.Mock(side_effect=[web_call, answer])
+        bot = SimpleNamespace(enable_web_search=False, stream=True, other_params={})
+        patches = _gateway_patches(stream=stream)
+        for p in patches:
+            p.start()
+        try:
+            result = _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=[KB_TOOL], channel_name='c1',
+            )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        self.assertEqual(result[0], 'Here is an activity.')
+        self.assertEqual(stream.call_count, 2)
+
+    def test_none_content_does_not_raise(self):
+        none_content = {'choices': [{'message': {'content': None}, 'finish_reason': 'stop'}]}
+        result, _, _ = self.run_turn([none_content], tools=())
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], '')
