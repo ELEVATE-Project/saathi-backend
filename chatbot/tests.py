@@ -240,10 +240,11 @@ class WebSearchToolTests(SimpleTestCase):
         uses = [[t['max_uses'] for t in self.web_tools(c)] for c in gateway.call_args_list]
         self.assertEqual(uses, [[2], [2], [2]])
 
-    def test_no_count_and_no_citations_counts_no_search(self):
+    def test_first_no_evidence_call_keeps_the_allowance_second_removes_it(self):
         # T50: web_search is offered from the first call, and providers omit the count when no search ran
-        # (Anthropic sends server_tool_use only after a search; streamed OpenRouter loses it, T46). A call with
-        # no count, no citations and no search results is a call without a search, so the tool list stays fixed.
+        # (Anthropic sends server_tool_use only after a search; streamed OpenRouter loses it, T46). The FIRST call
+        # with no count, no citations and no search results counts as no search, so the tool list stays fixed.
+        # A second such call in the same turn is unsure: no more searches (a turn cannot beat its limit).
         for provider, key in (('openrouter', 'parameters'), ('anthropic', None)):
             with self.subTest(provider=provider):
                 gateway = self.run_turn([KB_CALL, KB_CALL, FINAL_ANSWER], provider=provider, tools=[KB_TOOL])
@@ -251,7 +252,7 @@ class WebSearchToolTests(SimpleTestCase):
                     [(t[key] if key else t)['max_uses'] for t in self.web_tools(c)]
                     for c in gateway.call_args_list
                 ]
-                self.assertEqual(counts, [[2], [2], [2]])
+                self.assertEqual(counts, [[2], [2], []])
 
     def test_stream_counts_searches_from_the_finish_payload(self):
         finish = {'finish_reason': 'stop', 'citations': [ANTHROPIC_SEARCH], 'usage': {}}
@@ -295,8 +296,13 @@ class WebSearchToolTests(SimpleTestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             self.run_turn([KB_CALL_0, _kb_call_with_web([ANTHROPIC_SEARCH]), FINAL_ANSWER], tools=[KB_TOOL])
-        # The last call reports no count and no citations, so it made no search (T50); the count stays 1.
+        # The last call reports no count and no citations: the first such call counts as no search (T50).
         self.assertIn('web_searches=1 unsure_calls=0', out.getvalue())
+
+    def test_no_evidence_marker_never_reaches_usage_cost(self):
+        turn_usage = {'input_tokens': 5, 'web_searches': 0, 'web_searches_unsure': 0, 'web_no_evidence_calls': 2}
+        _, extra, _ = _Handler()._with_turn_usage('x', None, 'stop', turn_usage)
+        self.assertEqual(extra['_usage_cost'], {'input_tokens': 5})
 
 
 class WebSearchParamsTests(SimpleTestCase):
@@ -1116,3 +1122,67 @@ class StableToolListTests(SimpleTestCase):
         result, _, _ = self.run_turn([none_content], tools=())
         self.assertIsNotNone(result)
         self.assertEqual(result[0], '')
+
+
+WEB_RESULT = {'content': [{'type': 'web_search_result', 'url': 'https://w.example', 'title': 'Web page',
+                           'cited_text': 'Web fact about fractions.'}]}
+
+
+class WebResultsWithToolCallTests(SimpleTestCase):
+    """T50: web results found in the same response as a KB call are kept (context and sources), not dropped."""
+
+    def run_turn(self, responses=None, stream=None):
+        bot = SimpleNamespace(enable_web_search=True, stream=bool(stream), other_params={})
+        gateway = mock.Mock(side_effect=responses)
+        patches = _gateway_patches(gateway=None if stream else gateway, stream=stream) + [
+            mock.patch('chatbot.services.vector.vector_service.fetch_context_for_query',
+                       return_value=('', [CHUNK])),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            result = _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=[KB_TOOL],
+                channel_name='c1' if stream else None,
+            )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+        return result, gateway
+
+    @staticmethod
+    def second_call_tool_result(messages):
+        return next(m for m in messages if m['role'] == 'tool')['content']
+
+    def test_non_stream_web_results_reach_the_next_call_and_the_final_chunks(self):
+        kb_with_web = json.loads(json.dumps(KB_CALL_0))
+        kb_with_web['choices'][0]['message']['citations'] = [WEB_RESULT]
+        result, gateway = self.run_turn(responses=[kb_with_web, FINAL_ANSWER])
+        text = self.second_call_tool_result(gateway.call_args_list[1].kwargs['messages'])
+        self.assertIn('Fold a paper strip in halves.', text)  # the KB text is still there
+        self.assertIn('<retrieved_content source="web">', text)
+        self.assertIn('Web fact about fractions.', text)
+        self.assertLess(text.index('Fold a paper strip'), text.index('Web fact'))
+        chunk_urls = [c.get('url') for c in result[1]['_retrieved_chunks']]
+        self.assertIn('https://w.example', chunk_urls)
+        self.assertIn('https://w.example', [src.get('url') for src in result[1]['sources']])
+        self.assertNotIn('_web_chunks', result[1])
+
+    def test_stream_web_results_reach_the_next_call_and_the_final_sources(self):
+        kb_stream = iter([
+            ('', {'index': 0, 'id': 'tc_1', 'name': 'search_knowledge_base',
+                  'arguments_delta': '{"query": "fractions"}'}, None, None, None),
+            ('', None, None, [{'url': 'https://w.example', 'title': 'Web page',
+                               'cited_text': 'Web fact about fractions.'}], None),
+            ('', None, 'tool_calls', None, {'finish_reason': 'tool_calls', 'usage': {'web_search_requests': 1}}),
+        ])
+        answer = iter([('Here is an activity.', None, None, None, None),
+                       ('', None, 'stop', None, {'finish_reason': 'stop'})])
+        stream = mock.Mock(side_effect=[kb_stream, answer])
+        result, _ = self.run_turn(stream=stream)
+        text = self.second_call_tool_result(stream.call_args_list[1].kwargs['messages'])
+        self.assertIn('Fold a paper strip in halves.', text)
+        self.assertIn('<retrieved_content source="web">', text)
+        self.assertIn('Web fact about fractions.', text)
+        self.assertIn('https://w.example', [src.get('url') for src in result[1]['sources']])

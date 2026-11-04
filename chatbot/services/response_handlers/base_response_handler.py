@@ -449,6 +449,8 @@ class BaseResponseHandler(ABC):
             # Thinking blocks must go back unchanged on the assistant turn that carries the tool call.
             thinking_blocks = extra.pop('_thinking_blocks', None) if isinstance(extra, dict) else None
             tool_call_id = extra.pop('_tool_call_id', None) if isinstance(extra, dict) else None
+            # T50: web results found in the same response as a tool call; never passed on to process_response.
+            web_chunks = extra.pop('_web_chunks', None) if isinstance(extra, dict) else None
 
             if not (isinstance(response_data, dict) and 'function_call' in response_data):
                 if isinstance(extra, dict) and extra.pop('_respond_to_user_handled', False):
@@ -532,6 +534,15 @@ class BaseResponseHandler(ABC):
                 if tool_name == 'search_knowledge_base' and not new_chunks:
                     logger.info('[tool_loop] KB search found nothing')
             retrieved_chunks.extend(new_chunks or [])
+            if web_chunks:
+                # Keep the web results: for the final sources, and in this tool result so the model still sees them.
+                retrieved_chunks.extend(web_chunks)
+                web_parts = []
+                for c in web_chunks:
+                    header = f"[{c.get('title', '')}]({c['url']})" if c.get('url') else c.get('title', '')
+                    web_parts.append(f"Source: {header}\n{c.get('text', '')}".rstrip())
+                web_text = '\n'.join(web_parts)
+                tool_result_text = f"{tool_result_text}\n\n{self._wrap_retrieved_content(web_text, 'web')}"
 
             tool_call_id = tool_call_id or f'tool_{iteration}'
             args_str = _json.dumps(arguments) if isinstance(arguments, dict) else (arguments or '{}')
@@ -680,6 +691,9 @@ class BaseResponseHandler(ABC):
                 raw_args = executable_tc.get('function', {}).get('arguments', '{}')
                 arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                 tool_extra = {'_tool_call_id': executable_tc.get('id')}
+                web_chunks = self._extract_citation_chunks(message)  # T50: web results of this same response
+                if web_chunks:
+                    tool_extra['_web_chunks'] = web_chunks
                 if thinking_blocks:
                     tool_extra['_thinking_blocks'] = thinking_blocks
                 return {'function_call': {'name': executable_tc['function']['name'], 'arguments': arguments}}, tool_extra, 'function_call'
@@ -752,6 +766,9 @@ class BaseResponseHandler(ABC):
                 except json.JSONDecodeError:
                     arguments = {}
                 unoffered_extra = {'_unoffered_tool': True, '_tool_call_id': unoffered_tc.get('id')}
+                web_chunks = self._extract_citation_chunks(message)
+                if web_chunks:
+                    unoffered_extra['_web_chunks'] = web_chunks
                 if thinking_blocks:
                     unoffered_extra['_thinking_blocks'] = thinking_blocks
                 return {'function_call': {'name': tc_name, 'arguments': arguments}}, unoffered_extra, 'function_call'
@@ -916,6 +933,8 @@ class BaseResponseHandler(ABC):
                         extra_for_tool['_thinking_blocks'] = thinking_blocks
                 if unoffered:
                     extra_for_tool['_unoffered_tool'] = True
+                if citation_chunks and (tc['name'] in self._executable_tools or unoffered):
+                    extra_for_tool['_web_chunks'] = citation_chunks  # T50: kept by the tool loop
                 extra_for_tool = extra_for_tool or None
                 return {'function_call': {'name': tc['name'], 'arguments': tc_arguments}}, extra_for_tool, 'function_call'
 
@@ -1117,9 +1136,12 @@ class BaseResponseHandler(ABC):
         other citation shape doesn't give the count: the call is marked unsure and
         `_with_web_search_tool` offers no more searches this turn, so a retry or a second tool
         call never gets a fresh allowance. `web_searches` stays the count we know, for the log.
-        T50: no count, no citations and no search results means no search ran (web_search is
-        offered from the first call, and providers omit the count when they did not search), so
-        the tool list stays the same for the rest of the turn.
+        T50: web_search is offered from the first call, and providers omit the count when they did
+        not search. So the FIRST call of a turn with no evidence at all (no count, no search
+        results, no citations) counts as no search and keeps the allowance. Any later no-evidence
+        call in the same turn is marked unsure, as above. Worst case: one extra allowance per turn,
+        only when the first call searched, found nothing, and the count was lost.
+        `web_no_evidence_calls` is the per-turn marker for this; `_with_turn_usage` strips it.
         """
         if turn_usage is None or not searches_allowed:
             return
@@ -1136,6 +1158,10 @@ class BaseResponseHandler(ABC):
         if citations:
             turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + 1
             turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
+            return
+        if turn_usage.get('web_no_evidence_calls', 0) >= 1:
+            turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
+        turn_usage['web_no_evidence_calls'] = turn_usage.get('web_no_evidence_calls', 0) + 1
 
     def _with_turn_usage(self, response_data, extra, finish, turn_usage, request_ids=None):
         """Return a (response, extra, finish) tuple with turn_usage and the gateway request ids injected into extra."""
@@ -1144,7 +1170,7 @@ class BaseResponseHandler(ABC):
             f"[tool_loop] web_searches={turn_usage.get('web_searches', 0)} "
             f"unsure_calls={turn_usage.get('web_searches_unsure', 0)}"
         )
-        turn_usage = {k: v for k, v in turn_usage.items() if k not in ('web_searches', 'web_searches_unsure')}
+        turn_usage = {k: v for k, v in turn_usage.items() if k not in ('web_searches', 'web_searches_unsure', 'web_no_evidence_calls')}
         if any(turn_usage.values()):
             extra = dict(extra) if isinstance(extra, dict) else {}
             extra['_usage_cost'] = dict(turn_usage)
