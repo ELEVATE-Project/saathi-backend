@@ -15,6 +15,7 @@ from chatbot.models.enums import OperationTypeChoices, PreProcessOutputMode
 from chatbot.services.postprocessing.postprocessing_service import PostprocessingService
 from chatbot.services.preprocessing.preprocessing_service import PreprocessingService
 import logging
+import re
 import uuid
 
 logger = logging.getLogger('django')
@@ -22,6 +23,10 @@ channel_layer = get_channel_layer()
 
 # A safety refusal: 'content_filter' via LiteLLM, 'refusal' if the Anthropic stop_reason is passed through (T31).
 REFUSAL_FINISH_REASONS = ('content_filter', 'refusal')
+
+
+# Wrapper tags inside untrusted retrieved text (any case); see _wrap_retrieved_content.
+_WRAPPER_TAG = re.compile(r'</?retrieved_content', re.IGNORECASE)
 
 
 class BaseResponseHandler(ABC):
@@ -378,13 +383,11 @@ class BaseResponseHandler(ABC):
         turn_usage = {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0, 'cost_usd': 0.0, 'web_searches': 0,
                       'web_searches_unsure': 0}
 
-        # If the KB tool is present, web search is held back until KB returns nothing (fallback).
-        # If there is no KB tool, respect enable_web_search from the bot config immediately.
-        has_kb_tool = any(
-            (t.get('function', {}).get('name') or t.get('name', '')) == 'search_knowledge_base'
-            for t in (tools or [])
-        )
-        use_web_search = False if has_kb_tool else getattr(company_bot, 'enable_web_search', False)
+        # T50: the tool list is the same on every call of the turn (a changing list makes the model drop plans
+        # it made in call 1). Web search is offered from the first call when the bot has it on.
+        use_web_search = getattr(company_bot, 'enable_web_search', False)
+        kb_searched = False  # the KB tool ran once this turn; a repeat call gets a note, not a second search
+        unoffered_answered = False  # a call to a tool that was not offered is answered once per turn
         empty_respond_to_user_retried = False
         text_streamed = False  # any text of this turn already sent to the client
         # T04: ids on every call of this turn, so each gateway ledger row joins to the chat.
@@ -451,6 +454,8 @@ class BaseResponseHandler(ABC):
             # Thinking blocks must go back unchanged on the assistant turn that carries the tool call.
             thinking_blocks = extra.pop('_thinking_blocks', None) if isinstance(extra, dict) else None
             tool_call_id = extra.pop('_tool_call_id', None) if isinstance(extra, dict) else None
+            # T50: web results found in the same response as a tool call; never passed on to process_response.
+            web_chunks = extra.pop('_web_chunks', None) if isinstance(extra, dict) else None
 
             if not (isinstance(response_data, dict) and 'function_call' in response_data):
                 if isinstance(extra, dict) and extra.pop('_respond_to_user_handled', False):
@@ -482,20 +487,24 @@ class BaseResponseHandler(ABC):
                             turn_usage, request_ids,
                         )
                     return self._with_turn_usage(response_data, extra, finish, turn_usage, request_ids)
-                # Web search held back for KB fallback. Only retry if LLM gave NO response at all —
-                # a non-empty answer is a deliberate choice (and streaming already sent those tokens).
-                if not use_web_search and getattr(company_bot, 'enable_web_search', False) and iteration == 0 and not response_data:
-                    use_web_search = True
-                    call_kind = 'retry'
-                    logger.info('[tool_loop] LLM returned empty response — retrying with web search enabled')
-                    continue
                 response_data, extra, finish = result
                 return self._with_turn_usage(response_data, extra, finish, turn_usage, request_ids)
 
             tool_name = response_data['function_call'].get('name', '')
             arguments = response_data['function_call'].get('arguments', {})
 
-            if tool_name not in self._executable_tools:
+            unoffered = bool(extra.pop('_unoffered_tool', False)) if isinstance(extra, dict) else False
+            if unoffered and unoffered_answered:
+                logger.warning(f'[tool_loop] model called not-offered tool={tool_name} again — ending the turn '
+                               f'session={session_id}')
+                if use_stream and text_streamed:
+                    self._send_chunk(channel_name, '', finish_reason='stop')
+                err_msg, is_vernacular = self.get_error_message(company_bot, language)
+                return self._with_turn_usage(
+                    err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None, turn_usage,
+                    request_ids,
+                )
+            if not unoffered and tool_name not in self._executable_tools:
                 logger.info(f'[tool_loop] passing through tool={tool_name} to process_response')
                 response_data, extra, finish = result
                 if retrieved_chunks:
@@ -503,19 +512,38 @@ class BaseResponseHandler(ABC):
                     extra['_retrieved_chunks'] = retrieved_chunks
                 return self._with_turn_usage(response_data, extra, finish, turn_usage, request_ids)
 
-            logger.info(f'[tool_loop] iteration={iteration} executing tool={tool_name}')
-
-            tool_result_text, new_chunks = self._execute_tool(
-                tool_name=tool_name, arguments=arguments, company_bot=company_bot,
-            )
+            if unoffered:
+                unoffered_answered = True
+                logger.warning(f'[tool_loop] model called not-offered tool={tool_name} session={session_id}')
+                if tool_name in self._gateway_handled_tools:
+                    tool_result_text = (
+                        f'{tool_name} is not available in this chat. Answer without it; '
+                        'do not say you searched online.'
+                    )
+                else:
+                    tool_result_text = f'Tool "{tool_name}" is not available in this chat. Answer without it.'
+                new_chunks = []
+            elif tool_name == 'search_knowledge_base' and kb_searched:
+                logger.info('[tool_loop] repeated search_knowledge_base call — not run again')
+                tool_result_text = (
+                    "You already searched Saathi's material this turn. Use the results above; "
+                    'do not call search_knowledge_base again.'
+                )
+                new_chunks = []
+            else:
+                logger.info(f'[tool_loop] iteration={iteration} executing tool={tool_name}')
+                tool_result_text, new_chunks = self._execute_tool(
+                    tool_name=tool_name, arguments=arguments, company_bot=company_bot,
+                )
+                kb_searched = kb_searched or tool_name == 'search_knowledge_base'
+                if tool_name == 'search_knowledge_base' and not new_chunks:
+                    logger.info('[tool_loop] KB search found nothing')
             retrieved_chunks.extend(new_chunks or [])
-
-            # Web search stays available alongside KB results — chunks may pass the retrieval
-            # threshold but still miss the query, so the LLM decides whether to fall back.
-            if tool_name == 'search_knowledge_base':
-                use_web_search = getattr(company_bot, 'enable_web_search', False)
-                if not new_chunks:
-                    logger.info('[tool_loop] KB search empty — enabling web search for next iteration')
+            if web_chunks:
+                # Keep the web results: for the final sources, and in this tool result so the model still sees them.
+                retrieved_chunks.extend(web_chunks)
+                web_text = self._web_chunks_text(web_chunks)
+                tool_result_text = f"{tool_result_text}\n\n{self._wrap_retrieved_content(web_text, 'web')}"
 
             tool_call_id = tool_call_id or f'tool_{iteration}'
             args_str = _json.dumps(arguments) if isinstance(arguments, dict) else (arguments or '{}')
@@ -542,11 +570,7 @@ class BaseResponseHandler(ABC):
                 },
             ]
 
-            # Remove executed tool so the LLM cannot call it again
-            current_tools = [
-                t for t in (current_tools or [])
-                if (t.get('function', {}).get('name') or t.get('name', '')) != tool_name
-            ] or None
+            # T50: the tool list is not changed. The executed tool stays, so the list is the same on every call.
             current_tool_choice = 'auto' if current_tools else None
             append_to_last = True
             call_kind = 'tool'
@@ -600,9 +624,38 @@ class BaseResponseHandler(ABC):
         logger.error(f'[tool_loop] unknown tool: {tool_name}')
         return f'Tool "{tool_name}" is not available.', []
 
+    @staticmethod
+    def _tool_names(tools):
+        """Names of the tools in one request's tool list (function style or raw style)."""
+        return {(t.get('function', {}).get('name') or t.get('name', '')) for t in (tools or []) if isinstance(t, dict)}
+
+    def _is_unoffered_tool(self, name, tools, web_offered):
+        """T50: True if the model called a tool this request did not offer. `tools` is the list sent to the gateway."""
+        if name in self._metadata_tools:
+            return False
+        if name in self._gateway_handled_tools:
+            return not web_offered
+        return name not in self._tool_names(tools)
+
     def _wrap_retrieved_content(self, text, source):
-        """Wrap tool-retrieved text in an explicit provenance marker before it enters the transcript."""
+        """Wrap tool-retrieved text in an explicit provenance marker before it enters the transcript.
+
+        The text is untrusted (KB documents, web pages), so wrapper tags inside it are neutralised:
+        it cannot close the marker early or open a fake one.
+        """
+        text = _WRAPPER_TAG.sub(lambda m: '&lt;' + m.group(0)[1:], text or '')
         return f'<retrieved_content source="{source}">\n{text}\n</retrieved_content>'
+
+    @staticmethod
+    def _web_chunks_text(chunks):
+        """T50: web results as plain lines for a tool result. Only http(s) URLs become links."""
+        parts = []
+        for c in chunks:
+            url = c.get('url') or ''
+            title = c.get('title', '')
+            header = f'[{title}]({url})' if url.lower().startswith(('http://', 'https://')) else title
+            parts.append(f"Source: {header}\n{c.get('text', '')}".rstrip())
+        return '\n'.join(parts)
 
     def _call_gateway_non_stream(
         self, gateway_messages, company_bot, session_id, profile_id, tools, tool_choice,
@@ -614,6 +667,7 @@ class BaseResponseHandler(ABC):
         try:
             params = build_gateway_params(company_bot)
             tools, searches_allowed = self._with_web_search_tool(company_bot, params, tools, use_web_search, turn_usage)
+            web_offered = bool(searches_allowed) or (use_web_search and 'web_search_options' in params)
             print(f'[non_stream] use_web_search={use_web_search} bot.enable_web_search={getattr(company_bot, "enable_web_search", "N/A")} web_search_in_params={"web_search_options" in params}')
             effective_provider, effective_model = get_effective_provider_model(company_bot)
             data = call_llm_gateway(
@@ -654,6 +708,9 @@ class BaseResponseHandler(ABC):
                 raw_args = executable_tc.get('function', {}).get('arguments', '{}')
                 arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                 tool_extra = {'_tool_call_id': executable_tc.get('id')}
+                web_chunks = self._extract_citation_chunks(message)  # T50: web results of this same response
+                if web_chunks:
+                    tool_extra['_web_chunks'] = web_chunks
                 if thinking_blocks:
                     tool_extra['_thinking_blocks'] = thinking_blocks
                 return {'function_call': {'name': executable_tc['function']['name'], 'arguments': arguments}}, tool_extra, 'function_call'
@@ -696,10 +753,13 @@ class BaseResponseHandler(ABC):
                     return content, extra_content or None, finish_reason
                 # old format (has 'response' key) — falls through to passthrough_tc below
 
-            # Pass-through tools: not executable by us and not handled by the gateway → return to process_response
+            # Pass-through tools: offered in this call, not executable by us, not handled by the gateway
+            # → return to process_response
             passthrough_tc = next(
                 (tc for tc in tool_calls
-                 if (tc.get('function', {}).get('name') or tc.get('name', '')) not in self._gateway_handled_tools),
+                 if (tc.get('function', {}).get('name') or tc.get('name', '')) not in self._gateway_handled_tools
+                 and not self._is_unoffered_tool(
+                     tc.get('function', {}).get('name') or tc.get('name', ''), tools, web_offered)),
                 None,
             )
             if passthrough_tc:
@@ -708,7 +768,29 @@ class BaseResponseHandler(ABC):
                 arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                 return {'function_call': {'name': tc_name, 'arguments': arguments}}, None, 'function_call'
 
-            content = message.get('content', '')
+            # T50: a call to a tool this request did not offer (web_search with web search off, or a made-up name).
+            # The tool loop answers it with an error result; it must not fall through to the text below.
+            unoffered_tc = next(
+                (tc for tc in tool_calls
+                 if self._is_unoffered_tool(tc.get('function', {}).get('name') or tc.get('name', ''), tools, web_offered)),
+                None,
+            )
+            if unoffered_tc:
+                tc_name = unoffered_tc.get('function', {}).get('name') or unoffered_tc.get('name', '')
+                raw_args = unoffered_tc.get('function', {}).get('arguments', '{}')
+                try:
+                    arguments = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+                except json.JSONDecodeError:
+                    arguments = {}
+                unoffered_extra = {'_unoffered_tool': True, '_tool_call_id': unoffered_tc.get('id')}
+                web_chunks = self._extract_citation_chunks(message)
+                if web_chunks:
+                    unoffered_extra['_web_chunks'] = web_chunks
+                if thinking_blocks:
+                    unoffered_extra['_thinking_blocks'] = thinking_blocks
+                return {'function_call': {'name': tc_name, 'arguments': arguments}}, unoffered_extra, 'function_call'
+
+            content = message.get('content') or ''
             print(f'[non_stream_response] finish_reason={finish_reason} content={repr(content[:200])}')
 
             citation_chunks = self._extract_citation_chunks(message)
@@ -741,6 +823,7 @@ class BaseResponseHandler(ABC):
             tools, searches_allowed = self._with_web_search_tool(
                 company_bot, stream_params, tools, use_web_search, turn_usage,
             )
+            web_offered = bool(searches_allowed) or (use_web_search and 'web_search_options' in stream_params)
             print(f'[stream] use_web_search={use_web_search} bot.enable_web_search={getattr(company_bot, "enable_web_search", "N/A")} web_search_in_params={"web_search_options" in stream_params}')
             citation_chunks = []
             citation_events = []
@@ -860,10 +943,15 @@ class BaseResponseHandler(ABC):
                 if preamble_streamed:
                     # Signal to process_response handlers that text was already sent to WS
                     extra_for_tool['_text_streamed_to_ws'] = True
-                if tc['name'] in self._executable_tools:
+                unoffered = self._is_unoffered_tool(tc['name'], tools, web_offered)  # T50
+                if tc['name'] in self._executable_tools or unoffered:
                     extra_for_tool['_tool_call_id'] = tc['id'] or None
                     if thinking_blocks:
                         extra_for_tool['_thinking_blocks'] = thinking_blocks
+                if unoffered:
+                    extra_for_tool['_unoffered_tool'] = True
+                if citation_chunks and (tc['name'] in self._executable_tools or unoffered):
+                    extra_for_tool['_web_chunks'] = citation_chunks  # T50: kept by the tool loop
                 extra_for_tool = extra_for_tool or None
                 return {'function_call': {'name': tc['name'], 'arguments': tc_arguments}}, extra_for_tool, 'function_call'
 
@@ -1062,13 +1150,21 @@ class BaseResponseHandler(ABC):
 
         Best source: the gateway's usage.web_search_requests (the provider's own count). Without
         it: Anthropic replies hold one web_search_tool_result per search, so count those. Any
-        other citation shape doesn't give the count. In both of those cases, and when there is
-        no count and no citations (a search can return none), the call is marked unsure and
-        `_with_web_search_tool` offers no more searches this turn: a retry or a second tool call
-        must never get a fresh allowance. `web_searches` stays the count we know, for the log.
+        other citation shape doesn't give the count: the call is marked unsure and
+        `_with_web_search_tool` offers no more searches this turn, so a retry or a second tool
+        call never gets a fresh allowance. `web_searches` stays the count we know, for the log.
+        T50: web_search is offered from the first call, and providers omit the count when they did
+        not search. So the FIRST call of a turn with no evidence at all (no count, no search
+        results, no citations) counts as no search and keeps the allowance. Any later no-evidence
+        call in the same turn is marked unsure, as above. Worst case: one extra allowance per turn,
+        only when the first call searched, found nothing, and the count was lost.
+        `web_calls_counted` counts every call that offered web search (with or without a count), so
+        only the turn's first call can get the exemption; `_with_turn_usage` strips it.
         """
         if turn_usage is None or not searches_allowed:
             return
+        first_call = turn_usage.get('web_calls_counted', 0) == 0
+        turn_usage['web_calls_counted'] = turn_usage.get('web_calls_counted', 0) + 1
         reported = (usage or {}).get('web_search_requests')
         if reported is not None:
             turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + min(int(reported), searches_allowed)
@@ -1081,7 +1177,10 @@ class BaseResponseHandler(ABC):
             return
         if citations:
             turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + 1
-        turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
+            turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
+            return
+        if not first_call:
+            turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
 
     def _with_turn_usage(self, response_data, extra, finish, turn_usage, request_ids=None):
         """Return a (response, extra, finish) tuple with turn_usage and the gateway request ids injected into extra."""
@@ -1090,7 +1189,7 @@ class BaseResponseHandler(ABC):
             f"[tool_loop] web_searches={turn_usage.get('web_searches', 0)} "
             f"unsure_calls={turn_usage.get('web_searches_unsure', 0)}"
         )
-        turn_usage = {k: v for k, v in turn_usage.items() if k not in ('web_searches', 'web_searches_unsure')}
+        turn_usage = {k: v for k, v in turn_usage.items() if k not in ('web_searches', 'web_searches_unsure', 'web_calls_counted')}
         if any(turn_usage.values()):
             extra = dict(extra) if isinstance(extra, dict) else {}
             extra['_usage_cost'] = dict(turn_usage)
