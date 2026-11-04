@@ -15,6 +15,7 @@ from chatbot.models.enums import OperationTypeChoices, PreProcessOutputMode
 from chatbot.services.postprocessing.postprocessing_service import PostprocessingService
 from chatbot.services.preprocessing.preprocessing_service import PreprocessingService
 import logging
+import re
 import uuid
 
 logger = logging.getLogger('django')
@@ -22,6 +23,10 @@ channel_layer = get_channel_layer()
 
 # A safety refusal: 'content_filter' via LiteLLM, 'refusal' if the Anthropic stop_reason is passed through (T31).
 REFUSAL_FINISH_REASONS = ('content_filter', 'refusal')
+
+
+# Wrapper tags inside untrusted retrieved text (any case); see _wrap_retrieved_content.
+_WRAPPER_TAG = re.compile(r'</?retrieved_content', re.IGNORECASE)
 
 
 class BaseResponseHandler(ABC):
@@ -537,11 +542,7 @@ class BaseResponseHandler(ABC):
             if web_chunks:
                 # Keep the web results: for the final sources, and in this tool result so the model still sees them.
                 retrieved_chunks.extend(web_chunks)
-                web_parts = []
-                for c in web_chunks:
-                    header = f"[{c.get('title', '')}]({c['url']})" if c.get('url') else c.get('title', '')
-                    web_parts.append(f"Source: {header}\n{c.get('text', '')}".rstrip())
-                web_text = '\n'.join(web_parts)
+                web_text = self._web_chunks_text(web_chunks)
                 tool_result_text = f"{tool_result_text}\n\n{self._wrap_retrieved_content(web_text, 'web')}"
 
             tool_call_id = tool_call_id or f'tool_{iteration}'
@@ -637,8 +638,24 @@ class BaseResponseHandler(ABC):
         return name not in self._tool_names(tools)
 
     def _wrap_retrieved_content(self, text, source):
-        """Wrap tool-retrieved text in an explicit provenance marker before it enters the transcript."""
+        """Wrap tool-retrieved text in an explicit provenance marker before it enters the transcript.
+
+        The text is untrusted (KB documents, web pages), so wrapper tags inside it are neutralised:
+        it cannot close the marker early or open a fake one.
+        """
+        text = _WRAPPER_TAG.sub(lambda m: '&lt;' + m.group(0)[1:], text or '')
         return f'<retrieved_content source="{source}">\n{text}\n</retrieved_content>'
+
+    @staticmethod
+    def _web_chunks_text(chunks):
+        """T50: web results as plain lines for a tool result. Only http(s) URLs become links."""
+        parts = []
+        for c in chunks:
+            url = c.get('url') or ''
+            title = c.get('title', '')
+            header = f'[{title}]({url})' if url.lower().startswith(('http://', 'https://')) else title
+            parts.append(f"Source: {header}\n{c.get('text', '')}".rstrip())
+        return '\n'.join(parts)
 
     def _call_gateway_non_stream(
         self, gateway_messages, company_bot, session_id, profile_id, tools, tool_choice,
@@ -1141,10 +1158,13 @@ class BaseResponseHandler(ABC):
         results, no citations) counts as no search and keeps the allowance. Any later no-evidence
         call in the same turn is marked unsure, as above. Worst case: one extra allowance per turn,
         only when the first call searched, found nothing, and the count was lost.
-        `web_no_evidence_calls` is the per-turn marker for this; `_with_turn_usage` strips it.
+        `web_calls_counted` counts every call that offered web search (with or without a count), so
+        only the turn's first call can get the exemption; `_with_turn_usage` strips it.
         """
         if turn_usage is None or not searches_allowed:
             return
+        first_call = turn_usage.get('web_calls_counted', 0) == 0
+        turn_usage['web_calls_counted'] = turn_usage.get('web_calls_counted', 0) + 1
         reported = (usage or {}).get('web_search_requests')
         if reported is not None:
             turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + min(int(reported), searches_allowed)
@@ -1159,9 +1179,8 @@ class BaseResponseHandler(ABC):
             turn_usage['web_searches'] = turn_usage.get('web_searches', 0) + 1
             turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
             return
-        if turn_usage.get('web_no_evidence_calls', 0) >= 1:
+        if not first_call:
             turn_usage['web_searches_unsure'] = turn_usage.get('web_searches_unsure', 0) + 1
-        turn_usage['web_no_evidence_calls'] = turn_usage.get('web_no_evidence_calls', 0) + 1
 
     def _with_turn_usage(self, response_data, extra, finish, turn_usage, request_ids=None):
         """Return a (response, extra, finish) tuple with turn_usage and the gateway request ids injected into extra."""
@@ -1170,7 +1189,7 @@ class BaseResponseHandler(ABC):
             f"[tool_loop] web_searches={turn_usage.get('web_searches', 0)} "
             f"unsure_calls={turn_usage.get('web_searches_unsure', 0)}"
         )
-        turn_usage = {k: v for k, v in turn_usage.items() if k not in ('web_searches', 'web_searches_unsure', 'web_no_evidence_calls')}
+        turn_usage = {k: v for k, v in turn_usage.items() if k not in ('web_searches', 'web_searches_unsure', 'web_calls_counted')}
         if any(turn_usage.values()):
             extra = dict(extra) if isinstance(extra, dict) else {}
             extra['_usage_cost'] = dict(turn_usage)
