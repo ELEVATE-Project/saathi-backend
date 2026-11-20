@@ -321,3 +321,44 @@ class MediaTemplateType(models.TextChoices):
     PDF = 'PDF', _('PDF')
     DOCX = 'DOCX', _('DOCX')
 
+
+class MipStatus(models.TextChoices):
+    """
+    Lifecycle of a generated MIP (Mip.status).
+    COMPLETED is only valid together with an end date (DB check constraint).
+    """
+    GENERATED = 'GENERATED', _('Generated')      # plan downloaded, no start date
+    STARTED = 'STARTED', _('Started')            # start date saved
+    PAUSED = 'PAUSED', _('Paused')               # user paused, can resume
+    COMPLETED = 'COMPLETED', _('Completed')      # user said done and gave the end date
+    CLOSED = 'CLOSED', _('Closed')               # stopped for good ("not completed")
+
+
+class MipStoryStatus(models.TextChoices):
+    """State of the celebratory report for a MIP (MipStory.status)."""
+    DECLINED = 'DECLINED', _('Declined')         # user doesn't want a report
+    IN_PROGRESS = 'IN_PROGRESS', _('In progress')  # started with the story provider
+    GENERATED = 'GENERATED', _('Generated')      # final report received (locked)
+
+
+class MipStoryProvider(models.TextChoices):
+    """External app that captures the improvement story. A new provider = one new value."""
+    MITRA = 'MITRA', _('Mitra')
+
+
+class MipCheckInTrigger(models.TextChoices):
+    """Event that starts a check-in rule's clock (MipCheckInRule.trigger)."""
+    MIP_CREATED = 'MIP_CREATED', _('MIP created')
+    START_DATE_SET = 'START_DATE_SET', _('Start date set')
+    TIMELINE_ENDED = 'TIMELINE_ENDED', _('Timeline ended')
+    COMPLETION_CLAIMED = 'COMPLETION_CLAIMED', _('Completion claimed (no end date yet)')
+    MIP_COMPLETED = 'MIP_COMPLETED', _('MIP completed')
+    STORY_LEFT = 'STORY_LEFT', _('Story left midway')
+
+
+class MipCheckInSchedule(models.TextChoices):
+    """How a check-in rule's due dates are worked out (MipCheckInRule.schedule_type)."""
+    DAY_OFFSETS = 'DAY_OFFSETS', _('Fixed days after the trigger')
+    EVERY_N_DAYS = 'EVERY_N_DAYS', _('Every N days until the plan ends')
+    PERCENT_OF_TIMELINE = 'PERCENT_OF_TIMELINE', _('Point in the plan timeline (%)')
+

@@ -39,6 +39,8 @@ nav:
           - Translation Layer: apps/chatbot/chatbot_translate.md
           - Models: apps/chatbot/models.md
           - Views: apps/chatbot/views.md
+          - Release Notes:
+              - "1.5.0": apps/chatbot/release_doc/release_1.5.0.md
 
 
   - Backend:
