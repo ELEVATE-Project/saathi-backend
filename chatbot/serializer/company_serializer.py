@@ -10,12 +10,18 @@ class CompanySerializer(serializers.ModelSerializer):
 
 
 class CompanyBotSerializer(serializers.ModelSerializer):
+    """Allowlisted metadata for public chat screens and nested vernaculars."""
+
     company = CompanySerializer(read_only=True)
     statemachine_length = serializers.SerializerMethodField()
 
     class Meta:
         model = CompanyBot
-        fields = '__all__'
+        fields = (
+            'id', 'name', 'company', 'route', 'bot_type',
+            'introductory_message', 'statemachine_length',
+        )
+        read_only_fields = fields
 
     def get_statemachine_length(self, obj):
         return obj.companystatemachine_set.count()
