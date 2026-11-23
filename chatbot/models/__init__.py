@@ -5,3 +5,4 @@ from .bot_vernacular_model import *
 from .profile_models import *
 from .language_provider_models import *
 from .company_models import *
+from .mip_models import *
