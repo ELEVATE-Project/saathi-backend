@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from chatbot.models import CompanyChat, ChatSession, ChatStatus, Profile, Company, TextConversionType, Voice, VoiceType
 import jwt
 from django.http import JsonResponse
+from chatbot.chat_auth import decode_access_token
 from chatbot.utils.audio_provider_utils import text_translate_provider
 from chatbot.utils.transliterate_utils import transliterate_text
 
@@ -76,11 +77,7 @@ def create_chatsession(request):
         return JsonResponse({"message": "Access token missing"}, status=401)
 
     try:
-        decoded = jwt.decode(
-            access_token,
-            JWT_PUBLIC_KEY,
-            algorithms=["HS256"]
-        )
+        decoded = decode_access_token(access_token)
         user_id = decoded.get("data", {}).get("id")
         first_name = decoded.get("data", {}).get("name")
         user_roles = decoded.get("roles", [])

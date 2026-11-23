@@ -1,10 +1,11 @@
 import django_filters
-from django.db.models import OuterRef, Subquery
+from django.db.models import OuterRef, Q, Subquery
 from rest_framework import generics
 from rest_framework.filters import OrderingFilter
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework import status
+from chatbot.chat_auth import IsVerifiedCaller, VerifiedTokenAuthentication
 from chatbot.filter.drf_filter import ChatSessionProfileFilter
 from chatbot.parsers import StrictJSONParser
 from chatbot.models import ChatSession, BotVernacular, SessionFlowName
@@ -31,15 +32,40 @@ def _with_latest_feedback(queryset):
     )
 
 
-class CompanyChatListCreateView(generics.ListCreateAPIView):
-    queryset = _with_latest_feedback(CompanyChat.objects.all().order_by('created_at'))
+def _owned_sessions(user_id):
+    """Sessions that belong to a user. A session made by create_chatsession carries only a
+    profile; one made by the websocket path carries user_id (and often a profile)."""
+    return ChatSession.objects.filter(Q(user_id=user_id) | Q(profile__userid=user_id))
+
+
+class OwnerOnlyMixin:
+    """Verified login required; reads are limited to the caller's own rows (T32, ISS-45).
+    Read-only: the frontend never writes to these paths."""
+    authentication_classes = [VerifiedTokenAuthentication]
+    permission_classes = [IsVerifiedCaller]
+
+    def owned_sessions(self):
+        return _owned_sessions(self.request.user.user_id)
+
+
+class OwnedChatMixin(OwnerOnlyMixin):
+    def get_queryset(self):
+        # CompanyChat.session is a plain string, not a foreign key, so match on the owner's session strings.
+        return _with_latest_feedback(
+            CompanyChat.objects.filter(session__in=self.owned_sessions().values('session'))
+        )
+
+
+class CompanyChatListCreateView(OwnedChatMixin, generics.ListAPIView):
     serializer_class = CompanyChatSerializer
     filter_backends = [django_filters.rest_framework.DjangoFilterBackend]
     filterset_fields = ['message', 'sender', 'receiver', 'session', 'status']
 
+    def get_queryset(self):
+        return super().get_queryset().order_by('created_at')
 
-class CompanyChatRetrieveUpdateDestroyView(generics.RetrieveUpdateAPIView):
-    queryset = _with_latest_feedback(CompanyChat.objects.all())
+
+class CompanyChatRetrieveUpdateDestroyView(OwnedChatMixin, generics.RetrieveAPIView):
     serializer_class = CompanyChatSerializer
 
 
@@ -91,35 +117,27 @@ def _annotate_first_user_message(qs):
     return qs.annotate(first_user_message=Subquery(first_msg_sq))
 
 
-class ChatSessionListCreateView(generics.ListCreateAPIView):
-    queryset = ChatSession.objects.all()
+class OwnedSessionMixin(OwnerOnlyMixin):
     serializer_class = ChatSessionSerializer
+
+    def get_queryset(self):
+        return _annotate_first_user_message(self.owned_sessions())
+
+
+class ChatSessionListCreateView(OwnedSessionMixin, generics.ListAPIView):
     filter_backends = [django_filters.rest_framework.DjangoFilterBackend, ChatSessionProfileFilter, OrderingFilter]
     filterset_fields = ['session', 'project_id', 'user_id', 'profile', 'session_type']
     ordering_fields = ['updated_at', 'created_at', 'id']
     ordering = ['-updated_at']
 
-    def get_queryset(self):
-        return _annotate_first_user_message(super().get_queryset())
 
-
-class ChatSessionRetrieveUpdateDestroyView(generics.RetrieveUpdateAPIView):
-    queryset = ChatSession.objects.all()
-    serializer_class = ChatSessionSerializer
+class ChatSessionRetrieveUpdateDestroyView(OwnedSessionMixin, generics.RetrieveAPIView):
     filter_backends = [django_filters.rest_framework.DjangoFilterBackend]
     filterset_fields = ['session']
 
-    def get_queryset(self):
-        return _annotate_first_user_message(super().get_queryset())
 
-
-class ChatSessionRetrieveUpdateDestroyViewSession(generics.RetrieveUpdateAPIView):
-    queryset = ChatSession.objects.all()
-    serializer_class = ChatSessionSerializer
+class ChatSessionRetrieveUpdateDestroyViewSession(OwnedSessionMixin, generics.RetrieveAPIView):
     lookup_field = 'session'
-
-    def get_queryset(self):
-        return _annotate_first_user_message(super().get_queryset())
 
 
 class FlowLanguagesView(generics.GenericAPIView):
