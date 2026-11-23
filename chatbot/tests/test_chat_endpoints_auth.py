@@ -107,6 +107,13 @@ class ChatEndpointAuthTests(TestCase):
                 with self.subTest(path=path):
                     self.assertEqual(self.get(path, make_token('user-a')).status_code, 401)
 
+    def test_unusable_server_key_gives_401_not_500(self):
+        pem_text = '-----BEGIN PUBLIC KEY-----\nabc\n-----END PUBLIC KEY-----'
+        with mock.patch.dict(os.environ, {'JWT_PUBLIC_KEY': pem_text}):
+            for path in self.all_paths():
+                with self.subTest(path=path):
+                    self.assertEqual(self.get(path, make_token('user-a')).status_code, 401)
+
     def test_authorization_header_alone_does_not_log_in(self):
         for path in self.all_paths():
             with self.subTest(path=path):

@@ -23,7 +23,12 @@ def decode_access_token(token):
     key = os.getenv('JWT_PUBLIC_KEY')
     if not key:
         raise InvalidTokenError('JWT_PUBLIC_KEY is not set')
-    return jwt.decode(token, key, algorithms=['HS256'])
+    try:
+        return jwt.decode(token, key, algorithms=['HS256'])
+    except jwt.InvalidKeyError as exc:
+        # A key that PyJWT refuses to use as an HS256 secret (for example a PEM text) is a server
+        # setting problem. Answer 401 like any other failed login, not 500.
+        raise InvalidTokenError('server key cannot verify HS256 tokens') from exc
 
 
 def user_id_from_claims(claims):
