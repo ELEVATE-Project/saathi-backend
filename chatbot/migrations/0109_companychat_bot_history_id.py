@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('chatbot', '0104_media_template'),
+        ('chatbot', '0108_mip_story'),
     ]
 
     operations = [
