@@ -23,7 +23,7 @@ def _safe_json_dumps(value):
 @shared_task
 def save_in_company_db(
         session_id, profile_id, initiated_by, message, chunks, status, translated_message=None, audio_base64=None,
-        stage=None, other_params=None, append_to_last=False
+        stage=None, other_params=None, append_to_last=False, bot_history_id=None
 ):
     if initiated_by == 'AI':
         receiver = Profile.objects.filter(id=profile_id).first()
@@ -42,7 +42,8 @@ def save_in_company_db(
         status=status,
         file_url=audio_base64,
         stage=stage,
-        other_params=other_params
+        other_params=other_params,
+        bot_history_id=bot_history_id,
     )
 
 

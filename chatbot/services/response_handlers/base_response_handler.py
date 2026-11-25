@@ -5,7 +5,7 @@ from django.db import transaction
 from chatbot.celery_tasks.common_chat_tasks import save_in_company_db
 from chatbot.celery_tasks.handle_message import translate_and_send_message
 from chatbot.llm_models.llm_gateway import (
-    build_gateway_params, call_llm_gateway, call_llm_gateway_stream, get_effective_provider_model,
+    build_call_metadata, build_gateway_params, call_llm_gateway, call_llm_gateway_stream, get_effective_provider_model,
 )
 from chatbot.models import ChatSession, ChatStatus, CompanyBotTypeChoices
 from chatbot.models.bot_vernacular_model import BotVernacular
@@ -14,6 +14,7 @@ from chatbot.models.enums import OperationTypeChoices, PreProcessOutputMode
 from chatbot.services.postprocessing.postprocessing_service import PostprocessingService
 from chatbot.services.preprocessing.preprocessing_service import PreprocessingService
 import logging
+import uuid
 
 logger = logging.getLogger('django')
 channel_layer = get_channel_layer()
@@ -72,6 +73,8 @@ class BaseResponseHandler(ABC):
         chat_session = ChatSession.objects.get(session=session_id)
         chunks = []
         is_function_call = False
+        # Prompt version when the turn starts; saved on its bot rows and sent on its LLM calls (T05).
+        kwargs['bot_history_id'] = self._bot_history_id(kwargs.get('company_bot'))
         early_return = self.check_early_return(chat_session, **kwargs)
         if early_return is not None:
             if isinstance(early_return, str):
@@ -135,7 +138,10 @@ class BaseResponseHandler(ABC):
 
         response = None
         streaming_completed = False
+        turn_start_chat_id = None
         if not is_function_call and not kwargs.get('skip_llm', False):
+            # Newest AI message before this turn: request ids go only to a message saved by this turn (T04).
+            turn_start_chat_id = self._last_ai_chat_id(session_id)
             result = self.get_llm_response(**kwargs)
 
             if isinstance(result, tuple):
@@ -147,6 +153,9 @@ class BaseResponseHandler(ABC):
 
                 if isinstance(extra_content, dict) and '_usage_cost' in extra_content:
                     kwargs['_usage_cost'] = extra_content.pop('_usage_cost')
+
+                if isinstance(extra_content, dict) and '_llm_request_ids' in extra_content:
+                    kwargs['_llm_request_ids'] = extra_content.pop('_llm_request_ids')
 
                 if isinstance(extra_content, dict) and extra_content.pop('_is_vernacular_error', False):
                     kwargs['is_bot_vernacular_message'] = True
@@ -239,8 +248,11 @@ class BaseResponseHandler(ABC):
             response, chat_session, chunks, streaming_completed=streaming_completed, **kwargs
         )
         _usage_cost = kwargs.get('_usage_cost')
-        if _usage_cost:
-            self._update_last_chat_usage(session_id, _usage_cost)
+        _llm_request_ids = kwargs.get('_llm_request_ids')
+        if _usage_cost or _llm_request_ids:
+            self._update_last_chat_usage(
+                session_id, _usage_cost, request_ids=_llm_request_ids, after_chat_id=turn_start_chat_id,
+            )
         return process_result
 
     def analyze_response_for_postprocessing(self, response):
@@ -320,12 +332,14 @@ class BaseResponseHandler(ABC):
         result = self._handle_gateway_response(
             system_prompt=system_prompt, messages=message_to_send, company_bot=company_bot,
             session_id=session_id, profile_id=profile_id, tools=tools, channel_name=channel_name,
-            language=kwargs.get('language'),
+            language=kwargs.get('language'), bot_history_id=kwargs.get('bot_history_id'),
         )
 
         if result is None or (isinstance(result, tuple) and result[0] is None):
             logger.error("LLM gateway response returned None")
-            return None, None, None
+            extra = result[1] if isinstance(result, tuple) and isinstance(result[1], dict) else {}
+            request_ids = extra.get('_llm_request_ids')
+            return None, ({'_llm_request_ids': request_ids} if request_ids else None), None
 
         response, extra_content, finish_reason = result
         return response, extra_content, finish_reason
@@ -333,7 +347,7 @@ class BaseResponseHandler(ABC):
 
     def _handle_gateway_response(
         self, system_prompt, messages, company_bot, session_id, profile_id, tools=None, channel_name=None,
-        language=None,
+        language=None, bot_history_id=None,
     ):
         import json as _json
 
@@ -371,16 +385,26 @@ class BaseResponseHandler(ABC):
         use_web_search = False if has_kb_tool else getattr(company_bot, 'enable_web_search', False)
         empty_respond_to_user_retried = False
         text_streamed = False  # any text of this turn already sent to the client
+        # T04: ids on every call of this turn, so each gateway ledger row joins to the chat.
+        turn_id = uuid.uuid4().hex[:12]
+        call_kind = 'answer'
+        request_ids = []
+        admin_metadata = metadata_param if isinstance(metadata_param, dict) else {}
 
         for iteration in range(max_iterations):
+            call_metadata = build_call_metadata(
+                session_id, company_bot, call_kind, turn_id=turn_id, language=language,
+                bot_history_id=bot_history_id,
+            )
             if use_stream:
                 result = self._handle_gateway_stream(
                     gateway_messages=current_messages, company_bot=company_bot,
                     session_id=session_id, profile_id=profile_id, tools=current_tools,
                     tool_choice=current_tool_choice, channel_name=channel_name,
-                    cache_policy=cache_policy, metadata=metadata_param,
+                    cache_policy=cache_policy, metadata={**admin_metadata, **call_metadata},
                     retrieved_chunks=retrieved_chunks, append_to_last=append_to_last,
-                    use_web_search=use_web_search, turn_usage=turn_usage,
+                    use_web_search=use_web_search, turn_usage=turn_usage, request_ids=request_ids,
+                    bot_history_id=bot_history_id,
                 )
             else:
                 result = self._call_gateway_non_stream(
@@ -388,7 +412,8 @@ class BaseResponseHandler(ABC):
                     session_id=session_id, profile_id=profile_id,
                     tools=current_tools, tool_choice=current_tool_choice,
                     retrieved_chunks=retrieved_chunks, append_to_last=append_to_last,
-                    use_web_search=use_web_search, turn_usage=turn_usage,
+                    use_web_search=use_web_search, turn_usage=turn_usage, request_ids=request_ids,
+                    metadata=call_metadata,
                 )
 
             print(f'[tool_loop] iteration={iteration} result={str(result)[:200]}')
@@ -398,7 +423,8 @@ class BaseResponseHandler(ABC):
             print("="*50)
 
             if not result or (isinstance(result, tuple) and result[0] is None):
-                return None, None, None
+                # Keep the ids of the calls already made this turn, so the fallback reply links to them (T04).
+                return None, ({'_llm_request_ids': list(request_ids)} if request_ids else None), None
 
             response_data, extra, finish = result
 
@@ -407,8 +433,9 @@ class BaseResponseHandler(ABC):
 
             if finish in REFUSAL_FINISH_REASONS:
                 # No retry of any kind: the same request would be refused again (T31).
-                # TODO(T04): tag this call as a refusal once T04's call metadata is merged.
-                logger.warning(f'[tool_loop] model refusal (finish_reason={finish}) session={session_id} — sending error message')
+                # The refused call is the last id in this turn's llm_request_ids (T04).
+                logger.warning(f'[tool_loop] model refusal (finish_reason={finish}) session={session_id} '
+                               f'request_id={request_ids[-1] if request_ids else None} — sending error message')
                 if use_stream and text_streamed:
                     # Tokens already sent can't be taken back: close that bubble so the error
                     # message shows as its own message, not glued to the earlier text.
@@ -416,6 +443,7 @@ class BaseResponseHandler(ABC):
                 err_msg, is_vernacular = self.get_error_message(company_bot, language)
                 return self._with_turn_usage(
                     err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None, turn_usage,
+                    request_ids,
                 )
 
             # Thinking blocks must go back unchanged on the assistant turn that carries the tool call.
@@ -425,8 +453,8 @@ class BaseResponseHandler(ABC):
             if not (isinstance(response_data, dict) and 'function_call' in response_data):
                 if isinstance(extra, dict) and extra.pop('_respond_to_user_handled', False):
                     if not response_data and not empty_respond_to_user_retried:
-                        # TODO(T04): tag this extra call call_kind=retry once T04's call metadata is merged.
                         empty_respond_to_user_retried = True
+                        call_kind = 'retry'
                         logger.info('[tool_loop] respond_to_user called with no text — retrying with correction')
                         retry_assistant = {
                             'role': 'assistant', 'content': None,
@@ -447,16 +475,20 @@ class BaseResponseHandler(ABC):
                     if not response_data:
                         logger.info('[tool_loop] respond_to_user still empty after retry — sending default error')
                         err_msg, is_vernacular = self.get_error_message(company_bot, language)
-                        return err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None
-                    return self._with_turn_usage(response_data, extra, finish, turn_usage)
+                        return self._with_turn_usage(
+                            err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None,
+                            turn_usage, request_ids,
+                        )
+                    return self._with_turn_usage(response_data, extra, finish, turn_usage, request_ids)
                 # Web search held back for KB fallback. Only retry if LLM gave NO response at all —
                 # a non-empty answer is a deliberate choice (and streaming already sent those tokens).
                 if not use_web_search and getattr(company_bot, 'enable_web_search', False) and iteration == 0 and not response_data:
                     use_web_search = True
+                    call_kind = 'retry'
                     logger.info('[tool_loop] LLM returned empty response — retrying with web search enabled')
                     continue
                 response_data, extra, finish = result
-                return self._with_turn_usage(response_data, extra, finish, turn_usage)
+                return self._with_turn_usage(response_data, extra, finish, turn_usage, request_ids)
 
             tool_name = response_data['function_call'].get('name', '')
             arguments = response_data['function_call'].get('arguments', {})
@@ -467,7 +499,7 @@ class BaseResponseHandler(ABC):
                 if retrieved_chunks:
                     extra = extra or {}
                     extra['_retrieved_chunks'] = retrieved_chunks
-                return self._with_turn_usage(response_data, extra, finish, turn_usage)
+                return self._with_turn_usage(response_data, extra, finish, turn_usage, request_ids)
 
             logger.info(f'[tool_loop] iteration={iteration} executing tool={tool_name}')
 
@@ -515,10 +547,14 @@ class BaseResponseHandler(ABC):
             ] or None
             current_tool_choice = 'auto' if current_tools else None
             append_to_last = True
+            call_kind = 'tool'
 
         logger.error('[tool_loop] max tool iterations reached')
         err_msg, is_vernacular = self.get_error_message(company_bot, language)
-        return err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, 'stop'
+        return self._with_turn_usage(
+            err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, 'stop',
+            turn_usage, request_ids,
+        )
 
     def _execute_tool(self, tool_name, arguments, company_bot):
         """Execute a tool call and return (result_text_for_llm, retrieved_chunks)."""
@@ -569,6 +605,7 @@ class BaseResponseHandler(ABC):
     def _call_gateway_non_stream(
         self, gateway_messages, company_bot, session_id, profile_id, tools, tool_choice,
         retrieved_chunks=None, append_to_last=False, use_web_search=False, turn_usage=None,
+        request_ids=None, metadata=None,
     ):
         """Single non-streaming LLM call, returns (response, extra, finish_reason)."""
         import json
@@ -580,11 +617,13 @@ class BaseResponseHandler(ABC):
             effective_provider, effective_model = get_effective_provider_model(company_bot)
             data = call_llm_gateway(
                 messages=gateway_messages, provider=effective_provider, model=effective_model,
-                params=params, tools=tools, tool_choice=tool_choice,
+                params=params, tools=tools, tool_choice=tool_choice, metadata=metadata,
             )
             logger.info(f"[gateway] raw response: {data}")
             if not data:
                 return None, None, None
+            if request_ids is not None and data.get('id'):
+                request_ids.append(data['id'])
 
             usage_cost = self._extract_usage_cost(data)
             if usage_cost:
@@ -686,7 +725,7 @@ class BaseResponseHandler(ABC):
     def _handle_gateway_stream(
         self, gateway_messages, company_bot, session_id, profile_id, tools, tool_choice,
         channel_name, cache_policy=None, metadata=None, retrieved_chunks=None, append_to_last=False,
-        use_web_search=False, turn_usage=None,
+        use_web_search=False, turn_usage=None, request_ids=None, bot_history_id=None,
     ):
         import json
         accumulated_content = []
@@ -724,6 +763,8 @@ class BaseResponseHandler(ABC):
                 if chunk_finish_data:
                     finish_chunk = chunk_finish_data
             self._log_if_truncated(finish_reason, session_id)
+            if request_ids is not None and (finish_chunk or {}).get('id'):
+                request_ids.append(finish_chunk['id'])
 
             usage_cost = self._extract_usage_cost(finish_chunk)
             if usage_cost:
@@ -777,6 +818,7 @@ class BaseResponseHandler(ABC):
                             message=content, chunks=all_chunks, status=ChatStatus.IN_PROGRESS,
                             stage=None, append_to_last=append_to_last,
                             other_params={'usage': usage_cost} if usage_cost else None,
+                            bot_history_id=bot_history_id,
                         )
                         self._send_chunk(channel_name, '', finish_reason='stop',
                                          extra_content={k: v for k, v in extra_content.items()
@@ -796,6 +838,7 @@ class BaseResponseHandler(ABC):
                     save_in_company_db(
                         session_id=session_id, profile_id=profile_id, initiated_by='AI',
                         message=preamble, chunks=None, status=ChatStatus.IN_PROGRESS, stage=None,
+                        bot_history_id=bot_history_id,
                     )
                 all_chunks_for_tool = list(retrieved_chunks or []) + citation_chunks
                 extra_for_tool = {}
@@ -821,6 +864,7 @@ class BaseResponseHandler(ABC):
                     message=content, chunks=all_chunks, status=ChatStatus.IN_PROGRESS, stage=None,
                     append_to_last=append_to_last,
                     other_params={'usage': usage_cost} if usage_cost else None,
+                    bot_history_id=bot_history_id,
                 )
             sources = self._prepare_sources(all_chunks)
             extra_content = {'sources': sources} if sources else None
@@ -956,11 +1000,14 @@ class BaseResponseHandler(ABC):
         except Exception:
             return fallback
 
-    def _with_turn_usage(self, response_data, extra, finish, turn_usage):
-        """Return a (response, extra, finish) tuple with turn_usage injected into extra."""
+    def _with_turn_usage(self, response_data, extra, finish, turn_usage, request_ids=None):
+        """Return a (response, extra, finish) tuple with turn_usage and the gateway request ids injected into extra."""
         if any(turn_usage.values()):
             extra = dict(extra) if isinstance(extra, dict) else {}
             extra['_usage_cost'] = dict(turn_usage)
+        if request_ids:
+            extra = dict(extra) if isinstance(extra, dict) else {}
+            extra['_llm_request_ids'] = list(request_ids)
         return response_data, extra or None, finish
 
     def _accumulate_usage(self, accumulator, usage_cost):
@@ -969,8 +1016,33 @@ class BaseResponseHandler(ABC):
             accumulator[k] = accumulator.get(k, 0) + (usage_cost.get(k) or 0)
         accumulator['cost_usd'] = round(accumulator.get('cost_usd', 0) + (usage_cost.get('cost_usd') or 0), 6)
 
-    def _update_last_chat_usage(self, session_id, usage_cost):
-        """Merge usage cost into the most recently saved AI CompanyChat for this session."""
+    def _bot_history_id(self, company_bot):
+        """Newest CompanyBot history_id (the prompt version), or None (T05). One query."""
+        history = getattr(company_bot, 'history', None)
+        if history is None:
+            return None
+        try:
+            return history.order_by('-history_id').values_list('history_id', flat=True).first()
+        except Exception as e:
+            logger.error(f'[_bot_history_id] failed: {e}')
+            return None
+
+    def _last_ai_chat_id(self, session_id):
+        """Id of the newest AI CompanyChat in this session, or None."""
+        from chatbot.models import CompanyChat
+        try:
+            return CompanyChat.objects.filter(
+                session=session_id, sender__id=1
+            ).order_by('-id').values_list('id', flat=True).first()
+        except Exception as e:
+            logger.error(f'[_last_ai_chat_id] failed: {e}')
+            return None
+
+    def _update_last_chat_usage(self, session_id, usage_cost, request_ids=None, after_chat_id=None):
+        """Merge usage cost and the turn's gateway request ids into the most recently saved AI CompanyChat.
+
+        Request ids are saved only if that message is newer than after_chat_id (saved by this turn).
+        """
         from chatbot.models import CompanyChat
         try:
             chat = CompanyChat.objects.filter(
@@ -978,7 +1050,11 @@ class BaseResponseHandler(ABC):
             ).order_by('-id').first()
             if chat:
                 other_params = chat.other_params or {}
-                other_params['usage'] = usage_cost
+                if usage_cost:
+                    other_params['usage'] = usage_cost
+                if request_ids and (after_chat_id is None or chat.id > after_chat_id):
+                    # Joins this chat row to its gateway ledger rows (T04).
+                    other_params['llm_request_ids'] = list(request_ids)
                 chat.other_params = other_params
                 chat.save(update_fields=['other_params'])
                 logger.info(f"[usage] saved turn usage to CompanyChat id={chat.id} usage={usage_cost}")
@@ -1179,7 +1255,7 @@ class BaseResponseHandler(ABC):
         return False
 
     def save_message(self, session_id, profile_id, message, chunks,
-                     status, translated_message, stage=None, other_params=None):
+                     status, translated_message, stage=None, other_params=None, bot_history_id=None):
         """Save message to database"""
         save_in_company_db(
             session_id=session_id,
@@ -1190,7 +1266,8 @@ class BaseResponseHandler(ABC):
             status=status,
             translated_message=translated_message,
             stage=stage,
-            other_params=other_params
+            other_params=other_params,
+            bot_history_id=bot_history_id,
         )
 
     def translate_message(self, message, channel_name, step_number, language, company_bot, extra_content=None,

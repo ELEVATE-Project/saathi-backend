@@ -1,3 +1,8 @@
+import asyncio
+import io
+import json
+import os
+from contextlib import redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
@@ -457,3 +462,315 @@ class ThinkingNotSentToClientTests(SimpleTestCase):
         for extra in sent_extras:
             self.assertNotIn('_thinking_blocks', extra)
         self.assertNotIn('_thinking_blocks', result[1] or {})
+
+
+class LogHygieneTests(SimpleTestCase):
+    """T35: secrets never reach the logs or stdout; other details stay (PD-53)."""
+
+    TOKEN = 'eyJ-test-access-token-T35'
+
+    def test_login_does_not_print_password(self):
+        from rest_framework.test import APIRequestFactory
+        from chatbot.views import api_views
+
+        request = APIRequestFactory().post(
+            '/login', {'email': 'teacher@example.com', 'password': 'hunter2-T35'}, format='json')
+        out = io.StringIO()
+        with mock.patch.object(api_views.Profile.objects, 'filter', return_value=[]), redirect_stdout(out):
+            api_views.login(request)
+        self.assertNotIn('hunter2-T35', out.getvalue())
+        self.assertIn('teacher@example.com', out.getvalue())
+
+    def test_create_profile_does_not_print_access_token(self):
+        from rest_framework.test import APIRequestFactory
+        from chatbot.views import profile_views
+
+        request = APIRequestFactory().post('/profile', {'access_token': self.TOKEN}, format='json')
+        out = io.StringIO()
+        with mock.patch.object(profile_views, 'create_profile_utils', return_value={'success': True, 'data': {}}), \
+                redirect_stdout(out):
+            profile_views.create_profile_views(request)
+        self.assertNotIn(self.TOKEN, out.getvalue())
+
+    def test_openai_stt_does_not_print_api_key(self):
+        from chatbot.translate.openai import openai_stt
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {'OPENAI_API_KEY': 'sk-test-key-T35'}), \
+                mock.patch.object(openai_stt, 'OpenAI', side_effect=RuntimeError('stop')), \
+                self.assertLogs('django', 'ERROR') as logs, redirect_stdout(out):
+            openai_stt.transcribe_audio('', 'wav', 'en', SimpleNamespace(other_params={}))
+        self.assertNotIn('sk-test-key-T35', out.getvalue() + '\n'.join(logs.output))
+
+    def test_bedrock_client_does_not_print_aws_key(self):
+        from chatbot.llm_models import llm_script
+
+        client = mock.Mock()
+        client.converse.side_effect = RuntimeError('stop')
+        out = io.StringIO()
+        with mock.patch.object(llm_script.boto3, 'client', return_value=client), redirect_stdout(out):
+            try:
+                llm_script.handle_bedrock_model.__wrapped__(
+                    {}, messages=None, aws_key='AKIATESTKEYT35', aws_secret_key='secret-T35')
+            except Exception:
+                pass
+        self.assertNotIn('AKIATESTKEYT35', out.getvalue())
+        self.assertNotIn('secret-T35', out.getvalue())
+
+    def _receive(self, frame):
+        from chatbot.consumers import async_consumer
+
+        consumer = async_consumer.AsyncSocketConsumer()
+        consumer.handle_access_token = mock.AsyncMock(return_value='u1')
+        consumer.upsert_elevate_profile = mock.AsyncMock(return_value={'error': 'unauthorized'})
+        consumer.send = mock.AsyncMock()
+        consumer.close = mock.AsyncMock()
+        with mock.patch.object(async_consumer, 'fetch_elevate_user', return_value={}), \
+                self.assertLogs('django', 'INFO') as logs:
+            asyncio.run(consumer.receive(frame))
+        return '\n'.join(logs.output)
+
+    def test_authenticate_frame_log_hides_access_token_only(self):
+        logged = self._receive(json.dumps({
+            'type': 'authenticate', 'sessionid': 'sess-T35', 'route': '/saathi-bot-eval',
+            'access_token': self.TOKEN,
+        }))
+        self.assertNotIn(self.TOKEN, logged)
+        self.assertIn('sess-T35', logged)
+        self.assertIn('/saathi-bot-eval', logged)
+
+    def test_non_json_frame_is_logged_by_size(self):
+        logged = self._receive('not json ' + self.TOKEN)
+        self.assertNotIn(self.TOKEN, logged)
+        self.assertIn(str(len('not json ' + self.TOKEN)), logged)
+
+
+ALLOWED_METADATA_KEYS = {'session_id', 'bot_id', 'bot_history_id', 'turn_id', 'call_kind', 'language'}
+
+
+def _respond(text, request_id=None):
+    reply = {'choices': [{
+        'message': {'content': text, 'tool_calls': [{
+            'id': 'tc_1', 'type': 'function',
+            'function': {'name': 'respond_to_user', 'arguments': '{"quick_reply_chips": []}'},
+        }]},
+        'finish_reason': 'tool_calls',
+    }]}
+    if request_id:
+        reply['id'] = request_id
+    return reply
+
+
+class CallMetadataTests(SimpleTestCase):
+    """T04: every LLM call carries ids (never text) so its gateway ledger row joins to the chat."""
+
+    def turn(self, gateway=None, stream=None, tools=None, other_params=None):
+        bot = SimpleNamespace(id=7, enable_web_search=False, stream=stream is not None,
+                              other_params=other_params or {})
+        patches = _gateway_patches(gateway=gateway, stream=stream) + [
+            mock.patch.object(_Handler, '_execute_tool', return_value=('Fold a strip.', [])),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            return _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'A fractions activity?'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=tools,
+                channel_name='c1' if stream is not None else None, language='hi',
+            )
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def sent(self, call_mock):
+        return [c.kwargs['metadata'] for c in call_mock.call_args_list]
+
+    def test_answer_call_sends_ids_only(self):
+        gateway = mock.Mock(return_value=_respond('Here is an activity.', 'req-a'))
+        result = self.turn(gateway=gateway)
+        [metadata] = self.sent(gateway)
+        self.assertLessEqual(set(metadata), ALLOWED_METADATA_KEYS)
+        self.assertEqual(metadata['call_kind'], 'answer')
+        self.assertEqual(metadata['session_id'], 's1')
+        self.assertEqual(metadata['bot_id'], 7)
+        self.assertEqual(metadata['language'], 'hi')
+        self.assertTrue(metadata['turn_id'])
+        self.assertNotIn('fractions', json.dumps(metadata))
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-a'])
+
+    def test_call_after_tool_result_is_tool(self):
+        gateway = mock.Mock(side_effect=[dict(KB_CALL, id='req-a'), dict(FINAL_ANSWER, id='req-b')])
+        result = self.turn(gateway=gateway, tools=[KB_TOOL])
+        kinds = [m['call_kind'] for m in self.sent(gateway)]
+        self.assertEqual(kinds, ['answer', 'tool'])
+        self.assertEqual(len({m['turn_id'] for m in self.sent(gateway)}), 1)
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-a', 'req-b'])
+
+    def test_empty_respond_to_user_retry_is_retry(self):
+        gateway = mock.Mock(side_effect=[_respond(''), _respond('Hello, how can I help?')])
+        self.turn(gateway=gateway)
+        self.assertEqual([m['call_kind'] for m in self.sent(gateway)], ['answer', 'retry'])
+
+    def test_empty_retry_failure_keeps_request_ids(self):
+        gateway = mock.Mock(side_effect=[_respond('', 'req-a'), _respond('', 'req-b')])
+        with mock.patch.object(_Handler, 'get_error_message', return_value=('Sorry.', False)):
+            result = self.turn(gateway=gateway)
+        self.assertEqual(result[0], 'Sorry.')
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-a', 'req-b'])
+
+    def test_failed_follow_up_call_keeps_request_ids(self):
+        gateway = mock.Mock(side_effect=[dict(KB_CALL, id='req-a'), None])
+        result = self.turn(gateway=gateway, tools=[KB_TOOL])
+        self.assertIsNone(result[0])
+        self.assertEqual(result[1], {'_llm_request_ids': ['req-a']})
+
+    def test_request_ids_skip_a_message_from_an_earlier_turn(self):
+        chat = SimpleNamespace(id=3, other_params={}, save=mock.Mock())
+        with mock.patch('chatbot.models.CompanyChat.objects') as chats:
+            chats.filter.return_value.order_by.return_value.first.return_value = chat
+            _Handler()._update_last_chat_usage('s1', {'input_tokens': 5}, request_ids=['req-a'], after_chat_id=3)
+        self.assertNotIn('llm_request_ids', chat.other_params)
+        self.assertEqual(chat.other_params['usage'], {'input_tokens': 5})
+
+    def test_stream_merges_admin_metadata_under_ours(self):
+        stream = mock.Mock(return_value=iter([
+            ('Hello.', None, None, None, None),
+            ('', None, 'stop', None, {'finish_reason': 'stop', 'id': 'req-s'}),
+        ]))
+        result = self.turn(stream=stream, other_params={'metadata': {'team': 'saathi', 'call_kind': 'admin'}})
+        [metadata] = self.sent(stream)
+        self.assertEqual(metadata['team'], 'saathi')
+        self.assertEqual(metadata['call_kind'], 'answer')
+        self.assertEqual(metadata['session_id'], 's1')
+        self.assertEqual(result[1]['_llm_request_ids'], ['req-s'])
+
+    def test_title_call_is_title(self):
+        from chatbot.celery_tasks import title_tasks
+
+        bot = SimpleNamespace(id=9, tool_context=None, context='Make a title.')
+        session = SimpleNamespace(title=None, company_bot=bot)
+        gateway = mock.Mock(return_value=None)
+        with mock.patch.object(title_tasks.ChatSession, 'objects') as sessions, \
+                mock.patch.object(title_tasks.Flow, 'objects') as flows, \
+                mock.patch.object(title_tasks.CompanyChat, 'objects'), \
+                mock.patch.object(title_tasks, 'get_guided_chat', return_value=[]), \
+                mock.patch.object(title_tasks, 'get_effective_provider_model', return_value=('anthropic', 'm')), \
+                mock.patch.object(title_tasks, 'build_gateway_params', return_value={}), \
+                mock.patch.object(title_tasks, 'call_llm_gateway', gateway):
+            sessions.filter.return_value.first.return_value = session
+            flows.filter.return_value.first.return_value = SimpleNamespace(title_bot=bot)
+            title_tasks.generate_session_title('s1')
+        metadata = gateway.call_args.kwargs['metadata']
+        self.assertEqual(metadata['call_kind'], 'title')
+        self.assertEqual(metadata['session_id'], 's1')
+        self.assertEqual(metadata['bot_id'], 9)
+
+    def test_request_ids_are_saved_on_the_chat_row(self):
+        chat = SimpleNamespace(id=3, other_params={'usage': {'input_tokens': 1}}, save=mock.Mock())
+        with mock.patch('chatbot.models.CompanyChat.objects') as chats:
+            chats.filter.return_value.order_by.return_value.first.return_value = chat
+            _Handler()._update_last_chat_usage('s1', {'input_tokens': 5}, request_ids=['req-a', 'req-b'])
+        self.assertEqual(chat.other_params['llm_request_ids'], ['req-a', 'req-b'])
+        self.assertEqual(chat.other_params['usage'], {'input_tokens': 5})
+
+
+class PromptVersionTests(SimpleTestCase):
+    """T05: each saved bot turn and each LLM call carry the bot's prompt version (its newest history_id)."""
+
+    def bot_with_history(self, history_id=412, stream=False):
+        history = mock.Mock()
+        history.order_by.return_value.values_list.return_value.first.return_value = history_id
+        return SimpleNamespace(id=7, enable_web_search=False, stream=stream, other_params={}, history=history)
+
+    def test_history_id_is_the_newest_history_row(self):
+        bot = self.bot_with_history(412)
+        self.assertEqual(_Handler()._bot_history_id(bot), 412)
+        bot.history.order_by.assert_called_once_with('-history_id')
+
+    def test_bot_without_history_gives_none(self):
+        self.assertIsNone(_Handler()._bot_history_id(SimpleNamespace(id=7)))
+        self.assertIsNone(_Handler()._bot_history_id(None))
+
+    def test_turn_reads_history_id_once_into_kwargs(self):
+        bot = self.bot_with_history(412)
+        handler = _Handler()
+        with mock.patch(f'{HANDLER_MODULE}.ChatSession.objects'), \
+                mock.patch.object(handler, 'check_early_return', return_value='early') as early:
+            handler.handle_response(session_id='s1', company_bot=bot)
+        self.assertEqual(early.call_args.kwargs['bot_history_id'], 412)
+        bot.history.order_by.assert_called_once()
+
+    def test_llm_response_passes_history_id_to_the_gateway_turn(self):
+        handler = _Handler()
+        with mock.patch(f'{HANDLER_MODULE}.ChatSession.objects'), \
+                mock.patch(f'{HANDLER_MODULE}.CompanyStateMachine.objects'), \
+                mock.patch.object(handler, '_handle_gateway_response', return_value=('Hi', None, 'stop')) as turn:
+            handler.get_llm_response(
+                system_prompt='You are Saathi.', messages=[], company_bot=SimpleNamespace(
+                    bot_type=CompanyBotTypeChoices.SIMPLE, tool_context=None),
+                session_id='s1', profile_id=None, channel_name=None, bot_history_id=412,
+            )
+        self.assertEqual(turn.call_args.kwargs['bot_history_id'], 412)
+
+    def run_turn(self, gateway=None, stream=None):
+        bot = self.bot_with_history(stream=stream is not None)
+        patches = _gateway_patches(gateway=gateway, stream=stream)
+        for p in patches:
+            p.start()
+        try:
+            from chatbot.services.response_handlers import base_response_handler as bh
+            _Handler()._handle_gateway_response(
+                system_prompt='You are Saathi.', messages=[{'role': 'user', 'content': 'Hi'}],
+                company_bot=bot, session_id='s1', profile_id=None, tools=None,
+                channel_name='c1' if stream is not None else None, bot_history_id=412,
+            )
+            return bh.save_in_company_db
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_non_stream_call_metadata_has_history_id(self):
+        gateway = mock.Mock(return_value=FINAL_ANSWER)
+        self.run_turn(gateway=gateway)
+        self.assertEqual(gateway.call_args.kwargs['metadata']['bot_history_id'], 412)
+
+    def test_stream_saves_and_sends_history_id(self):
+        stream = mock.Mock(return_value=iter([
+            ('Hello.', None, None, None, None),
+            ('', None, 'stop', None, {'finish_reason': 'stop', 'id': 'req-s'}),
+        ]))
+        save = self.run_turn(stream=stream)
+        self.assertEqual(stream.call_args.kwargs['metadata']['bot_history_id'], 412)
+        self.assertEqual(save.call_args.kwargs['bot_history_id'], 412)
+
+    def test_regular_reply_is_saved_with_history_id(self):
+        handler = CommonResponseHandler()
+        bot = SimpleNamespace(bot_type=CompanyBotTypeChoices.SIMPLE)
+        with mock.patch('chatbot.services.response_handlers.common_handler.CompanyStateMachine.objects'), \
+                mock.patch.object(handler, 'translate_message', return_value='Hi'), \
+                mock.patch(f'{HANDLER_MODULE}.save_in_company_db') as save:
+            handler._handle_regular_response(
+                response='Hi', chat_session=SimpleNamespace(current_step=1), company_bot=bot,
+                session_id='s1', channel_name='c1', language='en', profile_id=None, chunks=[],
+                current_step=1, bot_history_id=412,
+            )
+        self.assertEqual(save.call_args.kwargs['bot_history_id'], 412)
+
+    def test_save_in_company_db_writes_history_id(self):
+        from chatbot.celery_tasks import common_chat_tasks
+
+        for given, stored in ((412, 412), (None, None)):
+            with self.subTest(given=given), \
+                    mock.patch.object(common_chat_tasks, 'Profile'), \
+                    mock.patch.object(common_chat_tasks.CompanyChat, 'objects') as chats:
+                kwargs = {'bot_history_id': given} if given is not None else {}
+                common_chat_tasks.save_in_company_db(
+                    session_id='s1', profile_id=None, initiated_by='AI', message='Hi', chunks=None,
+                    status=None, **kwargs,
+                )
+            self.assertEqual(chats.create.call_args.kwargs['bot_history_id'], stored)
+
+    def test_chat_column_is_nullable(self):
+        from chatbot.models import CompanyChat
+
+        self.assertTrue(CompanyChat._meta.get_field('bot_history_id').null)

@@ -18,7 +18,6 @@ def transcribe_audio(
     try:
 
         client_api_key = os.getenv("OPENAI_API_KEY")
-        print("client_api_key: ", client_api_key)
         client = OpenAI(api_key=client_api_key)
 
         other_params = voice_provider.other_params or {}
