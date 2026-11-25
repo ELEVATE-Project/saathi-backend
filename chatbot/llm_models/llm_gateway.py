@@ -3,6 +3,7 @@ import os
 import re
 
 import requests
+from django.conf import settings
 
 logger = logging.getLogger('django')
 
@@ -18,6 +19,49 @@ _NO_SAMPLING_MODEL = re.compile(r'claude-(?:haiku|sonnet|opus|fable)-5[.-]')
 
 def model_rejects_sampling_params(model) -> bool:
     return bool(model) and bool(_NO_SAMPLING_MODEL.search(model))
+
+
+RAW_WEB_SEARCH_PROVIDERS = ('anthropic', 'openrouter')
+
+
+def web_search_budget(company_bot) -> int:
+    """Searches allowed in one turn (all calls together): the bot's override, else the setting."""
+    cfg = (company_bot.other_params or {}).get('web_search') or {}
+    budget = cfg.get('max_uses')
+    return settings.WEB_SEARCH_MAX_USES_PER_TURN if budget is None else int(budget)
+
+
+def build_web_search_tool(company_bot, provider, max_uses) -> dict | None:
+    """T28: the web search tool for one call, or None when no searches are left in the turn.
+
+    anthropic: the raw Anthropic server tool. openrouter: its `openrouter:web_search` server
+    tool (engine from the setting). `max_uses` is per request, so the caller passes what is left.
+    """
+    if max_uses <= 0:
+        return None
+    cfg = (company_bot.other_params or {}).get('web_search') or {}
+    location = cfg.get('user_location') or {
+        'type': 'approximate', 'country': settings.WEB_SEARCH_COUNTRY, 'timezone': settings.WEB_SEARCH_TIMEZONE,
+    }
+    allowed = cfg.get('allowed_domains')
+    excluded = cfg.get('excluded_domains')
+    if provider == 'openrouter':
+        parameters = {
+            'engine': cfg.get('engine') or settings.WEB_SEARCH_ENGINE_OPENROUTER,
+            'max_uses': max_uses,
+            'user_location': location,
+        }
+        if allowed:
+            parameters['allowed_domains'] = allowed
+        if excluded:
+            parameters['excluded_domains'] = excluded
+        return {'type': 'openrouter:web_search', 'parameters': parameters}
+    tool = {'type': 'web_search_20250305', 'name': 'web_search', 'max_uses': max_uses, 'user_location': location}
+    if allowed:
+        tool['allowed_domains'] = allowed
+    if excluded:
+        tool['blocked_domains'] = excluded  # Anthropic's name for excluded_domains
+    return tool
 
 
 def build_gateway_params(company_bot) -> dict:
@@ -56,7 +100,9 @@ def build_gateway_params(company_bot) -> dict:
         }
     if provider_options is not None:
         params['provider_options'] = provider_options
-    if getattr(company_bot, 'enable_web_search', False):
+    # T28: anthropic and openrouter get web search as a tool (build_web_search_tool), not as a param.
+    if getattr(company_bot, 'enable_web_search', False) \
+            and getattr(company_bot, 'gateway_provider', None) not in RAW_WEB_SEARCH_PROVIDERS:
         params['web_search_options'] = {
             'search_context_size': company_bot.web_search_context_size or 'medium'
         }
