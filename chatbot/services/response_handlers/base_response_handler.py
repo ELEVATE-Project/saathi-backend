@@ -18,6 +18,9 @@ import logging
 logger = logging.getLogger('django')
 channel_layer = get_channel_layer()
 
+# A safety refusal: 'content_filter' via LiteLLM, 'refusal' if the Anthropic stop_reason is passed through (T31).
+REFUSAL_FINISH_REASONS = ('content_filter', 'refusal')
+
 
 class BaseResponseHandler(ABC):
     """Base class for handling LLM responses with common functionality"""
@@ -26,8 +29,6 @@ class BaseResponseHandler(ABC):
         self.default_error_message = 'I am sorry, I could not understood completely. Could you rephrase this please?'
         self.preprocessing_service = PreprocessingService()
         self.postprocessing_service = PostprocessingService()
-        self.min_word_count = 3
-        self.max_retry_attempts = 2
         self._executable_tools = {'search_knowledge_base'}
         self._gateway_handled_tools = {'web_search'}
         self._metadata_tools = {'respond_to_user'}
@@ -42,39 +43,11 @@ class BaseResponseHandler(ABC):
             logger.error("Failed to fetch BotVernacular for language=%s: %s", language, e)
         return self.default_error_message, False
 
-    def _is_response_too_short(self, response):
-        """
-        Check if response is too short (less than 3 words).
-        Returns True if response needs to be regenerated.
-        """
-        try:
-            if not response or response == '':
-                return False
-
-            if isinstance(response, dict):
-                response_text = response.get('response', '')
-                if not response_text:
-                    return False
-            else:
-                response_text = str(response)
-
-            response_text = response_text.strip()
-            if not response_text:
-                return False
-
-            word_count = len(response_text.split())
-
-            logger.info(f"Response word count: {word_count}, text: '{response_text[:100]}...'")
-
-            if word_count < self.min_word_count:
-                logger.info(f"Response too short: {word_count} words (minimum: {self.min_word_count})")
-                return True
-
-            return False
-
-        except Exception as e:
-            logger.error(f"Error checking response length: {e}")
-            return False
+    def _log_if_truncated(self, finish_reason, session_id):
+        """Log a reply cut off by the token limit. It is sent as it is, with no retry (T07)."""
+        # The gateway passes 'length' (LiteLLM, OpenAI style) or 'max_tokens' (Anthropic direct).
+        if finish_reason in ('length', 'max_tokens'):
+            logger.warning(f'[gateway] reply truncated by max_tokens (finish_reason={finish_reason}) session={session_id}')
 
     def is_non_llm_state(self, state_machine):
         return (
@@ -397,6 +370,7 @@ class BaseResponseHandler(ABC):
         )
         use_web_search = False if has_kb_tool else getattr(company_bot, 'enable_web_search', False)
         empty_respond_to_user_retried = False
+        text_streamed = False  # any text of this turn already sent to the client
 
         for iteration in range(max_iterations):
             if use_stream:
@@ -428,17 +402,41 @@ class BaseResponseHandler(ABC):
 
             response_data, extra, finish = result
 
+            if isinstance(extra, dict) and extra.get('_text_streamed_to_ws'):
+                text_streamed = True
+
+            if finish in REFUSAL_FINISH_REASONS:
+                # No retry of any kind: the same request would be refused again (T31).
+                # TODO(T04): tag this call as a refusal once T04's call metadata is merged.
+                logger.warning(f'[tool_loop] model refusal (finish_reason={finish}) session={session_id} — sending error message')
+                if use_stream and text_streamed:
+                    # Tokens already sent can't be taken back: close that bubble so the error
+                    # message shows as its own message, not glued to the earlier text.
+                    self._send_chunk(channel_name, '', finish_reason='stop')
+                err_msg, is_vernacular = self.get_error_message(company_bot, language)
+                return self._with_turn_usage(
+                    err_msg, {'_is_vernacular_error': is_vernacular} if is_vernacular else None, None, turn_usage,
+                )
+
+            # Thinking blocks must go back unchanged on the assistant turn that carries the tool call.
+            thinking_blocks = extra.pop('_thinking_blocks', None) if isinstance(extra, dict) else None
+            tool_call_id = extra.pop('_tool_call_id', None) if isinstance(extra, dict) else None
+
             if not (isinstance(response_data, dict) and 'function_call' in response_data):
                 if isinstance(extra, dict) and extra.pop('_respond_to_user_handled', False):
                     if not response_data and not empty_respond_to_user_retried:
+                        # TODO(T04): tag this extra call call_kind=retry once T04's call metadata is merged.
                         empty_respond_to_user_retried = True
                         logger.info('[tool_loop] respond_to_user called with no text — retrying with correction')
+                        retry_assistant = {
+                            'role': 'assistant', 'content': None,
+                            'tool_calls': [{'id': 'tu_empty_retry', 'type': 'function',
+                                            'function': {'name': 'respond_to_user', 'arguments': '{}'}}],
+                        }
+                        if thinking_blocks:
+                            retry_assistant['thinking_blocks'] = thinking_blocks
                         current_messages = list(current_messages) + [
-                            {
-                                'role': 'assistant', 'content': None,
-                                'tool_calls': [{'id': 'tu_empty_retry', 'type': 'function',
-                                                'function': {'name': 'respond_to_user', 'arguments': '{}'}}],
-                            },
+                            retry_assistant,
                             {
                                 'role': 'tool', 'tool_call_id': 'tu_empty_retry',
                                 'name': 'respond_to_user',
@@ -485,18 +483,23 @@ class BaseResponseHandler(ABC):
                 if not new_chunks:
                     logger.info('[tool_loop] KB search empty — enabling web search for next iteration')
 
-            tool_call_id = f'tool_{iteration}'
+            tool_call_id = tool_call_id or f'tool_{iteration}'
             args_str = _json.dumps(arguments) if isinstance(arguments, dict) else (arguments or '{}')
+            assistant_turn = {
+                'role': 'assistant',
+                'content': None,
+                'tool_calls': [{
+                    'id': tool_call_id,
+                    'type': 'function',
+                    'function': {'name': tool_name, 'arguments': args_str},
+                }],
+            }
+            if thinking_blocks:
+                assistant_turn['thinking_blocks'] = thinking_blocks
+            elif other.get('thinking'):
+                logger.warning(f'[tool_loop] thinking is on but tool call {tool_name} came back with no thinking blocks session={session_id}')
             current_messages = list(current_messages) + [
-                {
-                    'role': 'assistant',
-                    'content': None,
-                    'tool_calls': [{
-                        'id': tool_call_id,
-                        'type': 'function',
-                        'function': {'name': tool_name, 'arguments': args_str},
-                    }],
-                },
+                assistant_turn,
                 {
                     'role': 'tool',
                     'tool_call_id': tool_call_id,
@@ -504,16 +507,6 @@ class BaseResponseHandler(ABC):
                     'content': tool_result_text,
                 },
             ]
-
-            if tool_name == 'search_knowledge_base' and use_web_search and not new_chunks:
-                # Not shown to the user — just nudges the gateway/LLM to actually invoke web_search
-                # instead of answering from internal knowledge, whenever our fallback logic enables it.
-                current_messages = current_messages + [
-                    {
-                        'role': 'assistant',
-                        'content': "I couldn't find this in our knowledge base. Let me search the web for this.",
-                    },
-                ]
 
             # Remove executed tool so the LLM cannot call it again
             current_tools = [
@@ -546,21 +539,21 @@ class BaseResponseHandler(ABC):
                     chunks_content += (
                         '\n\n---\n\n'
                         'These repository results passed the retrieval threshold, but check they actually '
-                        'answer the query before using them. If they do not, call the web_search tool now '
-                        'instead of answering from them or saying no result was found.'
+                        'answer the query before using them. If they do not, web search is available as a '
+                        'fallback.'
                     )
                 chunks_text = self._wrap_retrieved_content(chunks_content, source='repository')
             else:
                 if getattr(company_bot, 'enable_web_search', False):
                     no_result_message = (
-                        'No repository result found for this query. Web search is enabled for this bot — '
-                        'call the web_search tool now to answer this query before responding. '
-                        'Do not answer from general/internal knowledge first without doing web search.'
+                        'No repository result found for this query. Use web search to answer it. If web '
+                        'search finds nothing useful either, answer from general knowledge and tell the user '
+                        "the answer is not from Saathi's material or the web."
                     )
                 else:
                     no_result_message = (
-                        '(no repository result found — respond from general knowledge if appropriate, '
-                        'per no-hallucination rules)'
+                        'No repository result found for this query. If you answer from general knowledge, '
+                        "tell the user the answer is not from Saathi's material."
                     )
                 chunks_text = self._wrap_retrieved_content(no_result_message, source='none')
             logger.info(f'[tool_loop] search_knowledge_base: {len(retrieved_chunks)} chunks for query: {query}')
@@ -602,7 +595,11 @@ class BaseResponseHandler(ABC):
             choice = data.get('choices', [{}])[0]
             message = choice.get('message', {})
             finish_reason = choice.get('finish_reason')
+            self._log_if_truncated(finish_reason, session_id)
+            if finish_reason in REFUSAL_FINISH_REASONS:
+                return '', None, finish_reason
             tool_calls = message.get('tool_calls') or []
+            thinking_blocks = message.get('thinking_blocks')
 
             executable_tc = next(
                 (tc for tc in tool_calls
@@ -612,7 +609,10 @@ class BaseResponseHandler(ABC):
             if executable_tc:
                 raw_args = executable_tc.get('function', {}).get('arguments', '{}')
                 arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                return {'function_call': {'name': executable_tc['function']['name'], 'arguments': arguments}}, None, 'function_call'
+                tool_extra = {'_tool_call_id': executable_tc.get('id')}
+                if thinking_blocks:
+                    tool_extra['_thinking_blocks'] = thinking_blocks
+                return {'function_call': {'name': executable_tc['function']['name'], 'arguments': arguments}}, tool_extra, 'function_call'
 
             # respond_to_user new format: LLM response text is in message.content; tool args are metadata only
             respond_to_user_tc = next(
@@ -645,6 +645,8 @@ class BaseResponseHandler(ABC):
 
                     if all_chunks:
                         extra_content['_retrieved_chunks'] = all_chunks
+                    if thinking_blocks:
+                        extra_content['_thinking_blocks'] = thinking_blocks
 
                     extra_content['_respond_to_user_handled'] = True
                     return content, extra_content or None, finish_reason
@@ -721,12 +723,18 @@ class BaseResponseHandler(ABC):
                     finish_reason = chunk_finish_reason
                 if chunk_finish_data:
                     finish_chunk = chunk_finish_data
+            self._log_if_truncated(finish_reason, session_id)
 
             usage_cost = self._extract_usage_cost(finish_chunk)
             if usage_cost:
                 self._update_session_usage(session_id, usage_cost)
                 if turn_usage is not None:
                     self._accumulate_usage(turn_usage, usage_cost)
+
+            if finish_reason in REFUSAL_FINISH_REASONS:
+                # Nothing is saved; the tool loop sends the error message instead (T31).
+                return '', {'_text_streamed_to_ws': True} if accumulated_content else None, finish_reason
+            thinking_blocks = (finish_chunk or {}).get('thinking_blocks')
 
             if tool_calls_buffer:
                 tc = tool_calls_buffer[0]
@@ -775,7 +783,10 @@ class BaseResponseHandler(ABC):
                                                         if k != '_respond_to_user_handled'} or None)
                         return content, extra_content, 'stop'
                     else:
-                        # LLM generated no text — signal _handle_gateway_response to retry with correction
+                        # LLM generated no text — signal _handle_gateway_response to retry with correction.
+                        # Thinking blocks are added only here, after nothing was sent to the client.
+                        if thinking_blocks:
+                            extra_content['_thinking_blocks'] = thinking_blocks
                         return content, extra_content, None
 
                 # Any other tool call — preamble was already sent to WS token-by-token; only save to DB
@@ -793,6 +804,10 @@ class BaseResponseHandler(ABC):
                 if preamble_streamed:
                     # Signal to process_response handlers that text was already sent to WS
                     extra_for_tool['_text_streamed_to_ws'] = True
+                if tc['name'] in self._executable_tools:
+                    extra_for_tool['_tool_call_id'] = tc['id'] or None
+                    if thinking_blocks:
+                        extra_for_tool['_thinking_blocks'] = thinking_blocks
                 extra_for_tool = extra_for_tool or None
                 return {'function_call': {'name': tc['name'], 'arguments': tc_arguments}}, extra_for_tool, 'function_call'
 
