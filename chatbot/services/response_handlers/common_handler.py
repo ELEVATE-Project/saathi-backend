@@ -9,9 +9,17 @@ from chatbot.utils.audio_provider_utils import text_translate_provider
 import logging
 import json
 import os
+import re
 from json_repair import repair_json
 
 logger = logging.getLogger('django')
+
+_elevate_profile_value_pattern = os.getenv('ELEVATE_PROFILE_VALUE_REGEX')
+try:
+    ELEVATE_PROFILE_VALUE_REGEX = re.compile(_elevate_profile_value_pattern) if _elevate_profile_value_pattern else None
+except re.error as e:
+    logger.error('[onboarding_profile] invalid ELEVATE_PROFILE_VALUE_REGEX — validation disabled: %s', e)
+    ELEVATE_PROFILE_VALUE_REGEX = None
 
 
 class CommonResponseHandler(BaseResponseHandler):
@@ -811,13 +819,24 @@ class CommonResponseHandler(BaseResponseHandler):
     def _handle_profile_tool_response(self, response, chat_session, chunks, **kwargs):
         """Handle submit_user_context — mark onboarding complete, push context to Elevate, inject into extra_content."""
         arguments = response['function_call'].get('arguments', {})
+        logger.info(
+            '[onboarding_profile] step=1 tool_call received session=%s raw_arguments_type=%s raw_arguments=%s',
+            kwargs.get('session_id'), type(arguments).__name__, arguments
+        )
         if isinstance(arguments, str):
             try:
                 arguments = json.loads(arguments)
             except json.JSONDecodeError:
+                logger.error('[onboarding_profile] step=1 arguments not valid JSON — repairing raw=%r', arguments)
                 arguments = repair_json(arguments, return_objects=True)
 
         profile_id = kwargs.get('profile_id')
+        logger.info(
+            '[onboarding_profile] step=2 parsed arguments=%s profile_id=%s access_token_present=%s channel_name=%s',
+            arguments, profile_id, bool(kwargs.get('access_token')), kwargs.get('channel_name')
+        )
+        if not profile_id:
+            logger.error('[onboarding_profile] step=2 no profile_id in kwargs — skipping save and Elevate update')
         if profile_id:
             self._save_submitted_user_context(
                 profile_id, arguments,
@@ -844,16 +863,33 @@ class CommonResponseHandler(BaseResponseHandler):
         this happens rarely (once per onboarding), so there's no need to wait for a reconnect/re-fetch from Elevate."""
         from chatbot.models.profile_models import Profile
         try:
+            if not isinstance(arguments, dict):
+                logger.error('[onboarding_profile] step=3 arguments is %s, not dict — value=%r',
+                             type(arguments).__name__, arguments)
+                arguments = {}
+
+            cleaned_arguments = {}
+            for field in ('name', 'role', 'school_name', 'district', 'state'):
+                value = arguments.get(field)
+                if value is None:
+                    continue
+                value = str(value)
+                cleaned = value
+                if ELEVATE_PROFILE_VALUE_REGEX is not None:
+                    cleaned = ''.join(c for c in value if ELEVATE_PROFILE_VALUE_REGEX.match(c))
+                    cleaned = ' '.join(cleaned.split())
+                if cleaned != value:
+                    logger.info('[onboarding_profile] step=3 cleaned field=%s %r -> %r', field, value, cleaned)
+                if cleaned:
+                    cleaned_arguments[field] = cleaned
+                else:
+                    logger.error('[onboarding_profile] step=3 dropping field=%s — no valid characters in %r', field, value)
+            arguments = cleaned_arguments
+
             profile = Profile.objects.filter(id=profile_id).first()
             if not profile:
-                logger.info('[submit_user_context] profile not found for id=%s', profile_id)
+                logger.error('[onboarding_profile] step=3 profile not found for id=%s', profile_id)
                 return
-
-            other_params = profile.other_params or {}
-            other_params['is_onboarding_completed'] = True
-            profile.other_params = other_params
-            profile.save(update_fields=['other_params'])
-            logger.info('[submit_user_context] marked onboarding complete for profile id=%s', profile_id)
 
             if channel_name:
                 field_map = {
@@ -872,11 +908,16 @@ class CommonResponseHandler(BaseResponseHandler):
                         "type": "profile_update",
                         "ums_profile_updates": ums_profile_updates,
                     })
-                    logger.info('[submit_user_context] pushed live ums_profile update=%s', ums_profile_updates)
+                    logger.info('[onboarding_profile] step=3 pushed live ums_profile update=%s', ums_profile_updates)
 
-            if access_token:
+            if not access_token:
+                logger.error('[onboarding_profile] step=4 no access_token — Elevate update skipped for profile id=%s',profile_id)
+                return
+
+            if arguments:
+                logger.info('[onboarding_profile] step=4 calling update_elevate_profile profile_id=%s', profile_id)
                 from chatbot.utils.elevate.profile_utils import update_elevate_profile
-                update_elevate_profile(
+                result = update_elevate_profile(
                     access_token=access_token,
                     name=arguments.get('name'),
                     role=arguments.get('role'),
@@ -884,9 +925,23 @@ class CommonResponseHandler(BaseResponseHandler):
                     district=arguments.get('district'),
                     state=arguments.get('state'),
                 )
+                if isinstance(result, dict) and result.get('error'):
+                    logger.error('[onboarding_profile] step=5 Elevate update FAILED profile_id=%s result=%s',
+                                 profile_id, result)
+                    return
+                logger.info('[onboarding_profile] step=5 Elevate update done profile_id=%s result=%s',
+                            profile_id, result)
+            else:
+                logger.info('[onboarding_profile] step=4 no valid fields to send — Elevate update skipped')
+
+            other_params = profile.other_params or {}
+            other_params['is_onboarding_completed'] = True
+            profile.other_params = other_params
+            profile.save(update_fields=['other_params'])
+            logger.info('[onboarding_profile] step=6 marked is_onboarding_completed=True locally for profile id=%s', profile_id)
 
         except Exception as e:
-            logger.error('[submit_user_context] failed to save profile context: %s', e, exc_info=True)
+            logger.error('[onboarding_profile] failed to save profile context: %s', e, exc_info=True)
 
     def _translate_download_arguments(self, arguments: dict, language: str, company_bot) -> dict:
         if language == 'en':

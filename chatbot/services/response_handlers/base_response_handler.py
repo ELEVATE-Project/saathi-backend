@@ -732,6 +732,11 @@ class BaseResponseHandler(ABC):
                 tc = tool_calls_buffer[0]
                 raw_args = tc['arguments']
                 print(f'[stream_tool_call] name={tc["name"]} args={raw_args[:200]}')
+                if tc['name'] == 'submit_user_context':
+                    logger.info(
+                        '[onboarding_profile] step=0 LLM stream tool_call buffer_indexes=%s name=%s raw_args=%s',
+                        list(tool_calls_buffer.keys()), tc['name'], raw_args
+                    )
                 try:
                     tc_arguments = json.loads(raw_args)
                 except json.JSONDecodeError:
